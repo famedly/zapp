@@ -1,0 +1,82 @@
+# SPDX-FileCopyrightText: 2026 Famedly GmbH (info@famedly.com)
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+# zapp config
+
+# Address to listen on.
+listen = "[::1]:8080"
+
+[zitadel]
+url = "https://auth.example.com"
+# Private key JSON of the service user zapp acts as (console: service user
+# → Keys → New → JSON). It needs to manage users, projects and project
+# members in every organisation named by a grant: IAM_OWNER, or ORG_OWNER
+# on each of those organisations.
+key_file = "/run/secrets/zapp-key.json"
+# Service accounts and projects are named
+# "<prefix><host>[:<port>][/<path>]" (e.g. "zapp/app.famedly.dev/k8s"):
+# the issuer URL with "<scheme>://" replaced verbatim by a prefix chosen
+# by scheme. No separator is inserted, so include a trailing "/" (or
+# similar) in the prefix if one is wanted.
+account_prefix_https = "zapp/"
+# Prefix for plain-http issuers. Optional: if unset (the default), http
+# issuers are rejected outright. Must differ from account_prefix_https, as
+# the prefix is the only place the scheme is encoded. Only for local testing.
+account_prefix_http = "zapp-insecure/"
+# Personal access token lifetime (humantime syntax, e.g. "30m", "12h",
+# "7days"), used when a grant does not set its own duration.
+default_duration = "24h"
+
+# zapp always fetches {issuer}/.well-known/openid-configuration from the
+# token's issuer. If the metadata advertises an introspection_endpoint,
+# the token is verified via OAuth 2.0 token introspection (RFC 7662);
+# otherwise its signature is checked against the advertised jwks_uri (e.g.
+# Kubernetes service account tokens whose --service-account-issuer is
+# served publicly on the domain).
+[verification]
+# Audience the token must carry, regardless of how it is verified
+# (e.g. `kubectl create token <sa> --audience=zapp`).
+audience = "zapp"
+# Timeout in seconds for discovery, introspection and JWKS requests.
+timeout_secs = 10
+
+# Garbage collection of service accounts whose issuer stopped renewing.
+# Optional: omit the section to disable. An account's age is the time since
+# its newest personal access token or machine key was created (or since the
+# account was created, if it has none).
+[gc]
+# How often to run a collection pass.
+interval = "10m"
+# Age after which the service account and the projects it created are
+# deactivated. Must be at least the longest credential lifetime, so that
+# accounts are never deactivated while a credential is still valid. A
+# renewal reactivates account and project.
+soft = "24h"
+# Age after which the projects are deleted, then the account. Must not be
+# shorter than soft.
+hard = "36h"
+
+# Grants are matched in order; the first matching pattern wins. A pattern is
+# a full issuer pattern: scheme ("*" for any), host matched label by label
+# ('*' once per label, "**" as its own label for any number of labels) with
+# an optional ":port" (":*" for any port), and the path matched segment by
+# segment ('*' once per segment, "/**/" once per path for any number of
+# segments), e.g. "https://*.famedly.dev/**".
+#
+# Only use https:// patterns in production: an http:// (or *://) pattern
+# entitles plain-http issuers, whose ownership proof can be spoofed on the
+# network. http:// exists for local testing, e.g. with the mock issuer
+# (`cargo run --example mock_client`), and additionally requires
+# zitadel.account_prefix_http to be set:
+#
+# [[grants]]
+# pattern = "http://localhost:*"
+# org_id = "123456789012345678"
+
+[[grants]]
+pattern = "https://trusted.example.com/k8s"
+# Zitadel organisation the service account and project are created in.
+org_id = "123456789012345678"
+# Optional per-grant token lifetime.
+duration = "12h"
