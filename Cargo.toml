@@ -1,0 +1,36 @@
+# SPDX-FileCopyrightText: 2026 Famedly GmbH (info@famedly.com)
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+[package]
+description = "Zitadel Automatic Project Provisioner"
+edition = "2024"
+license = "AGPL-3.0-or-later"
+name = "zapp"
+repository = "https://github.com/famedly/zapp"
+version = "0.1.0"
+
+[dependencies]
+anyhow = "1"
+axum = { version = "0.8.9", features = ["query"] }
+base64 = "0.22"
+famedly-zitadel-rust-client = "0.14"
+futures = "0.3"
+humantime = "2"
+humantime-serde = "1"
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
+reqwest = { version = "0.13.4", features = ["json", "query", "form"] }
+reqwest-middleware = "0.5"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+time = { version = "0.3", features = ["formatting"] }
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+toml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = { version = "2", features = ["serde"] }
+
+[dev-dependencies]
+p256 = { version = "0.13", features = ["pem"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
