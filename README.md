@@ -148,15 +148,14 @@ Every step is optimistic and converges under concurrent requests:
 
 The issued credential acts as the service account, which holds only
 `PROJECT_OWNER` on its project, plus any `instance_roles` its grant names.
-Instance roles reach across every organisation (`IAM_OWNER_VIEWER`, for
-example, reads all users), so they are only accepted on grants for an exact
-issuer, never on a wildcard pattern. Removing them from a grant does not
-revoke memberships already granted; they go when garbage collection deletes
-the account, or by hand. Tested against Zitadel, that lets it rename
-itself (`UpdateMyUserName`), remove its own project membership and delete its
-project, but _not_ write its own metadata (`SetUserMetadata` needs `user.write`;
-the auth API has no metadata write at all). zapp therefore relies on nothing the
-account can change:
+Instance roles reach across every organisation (`IAM_OWNER_VIEWER`, for example,
+reads all users), so they are only accepted on grants for an exact issuer, never
+on a wildcard pattern. Removing them from a grant does not revoke memberships
+already granted; they go when garbage collection deletes the account, or by
+hand. Tested against Zitadel, that lets it rename itself (`UpdateMyUserName`),
+remove its own project membership and delete its project, but _not_ write its
+own metadata (`SetUserMetadata` needs `user.write`; the auth API has no metadata
+write at all). zapp therefore relies on nothing the account can change:
 
 - Accounts are recognised by `origin` metadata, not by name.
 - Projects are tracked by `creator.*` metadata, not by membership. A
