@@ -209,8 +209,9 @@ impl ZitadelClient {
 
 	/// Ensures that in organisation `org_id` an active project `name` and
 	/// an active service account `name` exist, that the service account
-	/// records itself as creator of the project (metadata) and owns it, and
-	/// issues a credential of the requested kind valid for `duration`.
+	/// records itself as creator of the project (metadata), owns it and
+	/// holds exactly `instance_roles` on the instance (if any), and issues a
+	/// credential of the requested kind valid for `duration`.
 	///
 	/// Both are created optimistically and adopted (reactivated if needed)
 	/// on a name conflict, so renewals and concurrent requests converge on
@@ -223,11 +224,18 @@ impl ZitadelClient {
 		issuer: &str,
 		org_id: &str,
 		duration: Duration,
+		instance_roles: &[String],
 		credential_type: CredentialType,
 	) -> anyhow::Result<Provisioned> {
 		let project_id = self.ensure_project(name, org_id).await?;
 		let user_id = self.ensure_service_account(name, issuer, org_id, &project_id).await?;
 		self.ensure_project_owner(org_id, &project_id, &user_id).await?;
+		// ponytail: a grant whose instance_roles were removed leaves existing
+		// memberships in place until GC deletes the account. Revoking them
+		// here would need IAM_OWNER for every zapp, even without such grants.
+		if !instance_roles.is_empty() {
+			self.ensure_instance_member(&user_id, instance_roles).await?;
+		}
 
 		let expires_at = (OffsetDateTime::now_utc() + duration)
 			.format(&Rfc3339)
@@ -390,6 +398,38 @@ impl ZitadelClient {
 			info!("restored project owner role of service account {user_id} on {project_id}");
 		}
 		Ok(())
+	}
+
+	/// Makes the service account an instance member with exactly `roles`,
+	/// overwriting whatever roles it held before.
+	async fn ensure_instance_member(&self, user_id: &str, roles: &[String]) -> anyhow::Result<()> {
+		match self
+			.request::<IgnoredAny>(
+				Method::POST,
+				"admin/v1/members",
+				None,
+				Some(json!({ "userId": user_id, "roles": roles })),
+			)
+			.await
+		{
+			Ok(_) => return Ok(()),
+			Err(e) if has_status(&e, StatusCode::CONFLICT) => {}
+			Err(e) => return Err(e.context("making service account an instance member")),
+		}
+		match self
+			.request::<IgnoredAny>(
+				Method::PUT,
+				&format!("admin/v1/members/{user_id}"),
+				None,
+				Some(json!({ "roles": roles })),
+			)
+			.await
+		{
+			Ok(_) => Ok(()),
+			// Zitadel rejects an update that changes nothing.
+			Err(e) if has_status(&e, StatusCode::PRECONDITION_FAILED) => Ok(()),
+			Err(e) => Err(e.context("updating instance roles of service account")),
+		}
 	}
 
 	async fn find_project_named(
@@ -737,12 +777,27 @@ impl ZitadelClient {
 		org_id: &str,
 		body: Option<serde_json::Value>,
 	) -> anyhow::Result<T> {
-		let url = self.url.join(&format!("management/v1/{path}"))?;
+		self.request(method, &format!("management/v1/{path}"), Some(org_id), body).await
+	}
+
+	/// Sends a request to `path` (relative to the Zitadel base URL), acting
+	/// in organisation `org_id` if given, and parses the response.
+	/// Non-success answers surface as [`HttpError`].
+	async fn request<T: DeserializeOwned>(
+		&self,
+		method: Method,
+		path: &str,
+		org_id: Option<&str>,
+		body: Option<serde_json::Value>,
+	) -> anyhow::Result<T> {
+		let url = self.url.join(path)?;
 		let mut request = self
 			.http
 			.request(method, url)
-			.bearer_auth(self.token.token().await.context("refreshing Zitadel access token")?)
-			.header(HEADER_ZITADEL_ORGANIZATION_ID, org_id);
+			.bearer_auth(self.token.token().await.context("refreshing Zitadel access token")?);
+		if let Some(org_id) = org_id {
+			request = request.header(HEADER_ZITADEL_ORGANIZATION_ID, org_id);
+		}
 		if let Some(body) = &body {
 			request = request.json(body);
 		}

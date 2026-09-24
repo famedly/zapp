@@ -65,7 +65,8 @@ zapp [path/to/zapp.toml]    # defaults to ./zapp.toml
 zapp authenticates against Zitadel as a service user with a private key JSON
 file (`zitadel.key_file`). That service user must be able to manage users,
 projects and project members in every organisation named by a grant:
-`IAM_OWNER`, or `ORG_OWNER` on each of those organisations. See
+`IAM_OWNER`, or `ORG_OWNER` on each of those organisations. If any grant sets
+`instance_roles`, it needs `IAM_OWNER`. See
 [`zapp.example.toml`](zapp.example.toml) for all options.
 
 ## API
@@ -138,16 +139,23 @@ Every step is optimistic and converges under concurrent requests:
    refuses to adopt a human user of that name.
 1. **Make it `PROJECT_OWNER`**. On `409 Conflict` (already a member) the role is
    restored if the account had dropped it.
+1. **Grant instance roles**, only if the grant sets `instance_roles`: the
+   account becomes an instance member with exactly those roles (on
+   `409 Conflict` its roles are overwritten).
 1. **Issue the credential** with the grant's expiry.
 
 #### Trust model
 
 The issued credential acts as the service account, which holds only
-`PROJECT_OWNER` on its project. Tested against Zitadel, that lets it rename
-itself (`UpdateMyUserName`), remove its own project membership and delete its
-project, but _not_ write its own metadata (`SetUserMetadata` needs `user.write`;
-the auth API has no metadata write at all). zapp therefore relies on nothing the
-account can change:
+`PROJECT_OWNER` on its project, plus any `instance_roles` its grant names.
+Instance roles reach across every organisation (`IAM_OWNER_VIEWER`, for example,
+reads all users), so they are only accepted on grants for an exact issuer, never
+on a wildcard pattern. Removing them from a grant does not revoke memberships
+already granted; they go when garbage collection deletes the account, or by
+hand. Tested against Zitadel, that lets it rename itself (`UpdateMyUserName`),
+remove its own project membership and delete its project, but _not_ write its
+own metadata (`SetUserMetadata` needs `user.write`; the auth API has no metadata
+write at all). zapp therefore relies on nothing the account can change:
 
 - Accounts are recognised by `origin` metadata, not by name.
 - Projects are tracked by `creator.*` metadata, not by membership. A
@@ -188,6 +196,8 @@ any port), and the path part is matched segment by segment (`*` once per
 segment, `/**/` once per path for any number of segments). Each grant names the
 Zitadel organisation (`org_id`) to provision in and may set a token `duration`
 (humantime syntax such as `"12h"`), falling back to `zitadel.default_duration`.
+A grant for an exact issuer may also set `instance_roles` (e.g.
+`["IAM_OWNER_VIEWER"]`), see the trust model above.
 
 Because the scheme is part of the pattern, allowing plain-http issuers is an
 explicit opt-in per grant (on top of the `account_prefix_http` opt-in). Only use

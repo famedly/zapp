@@ -80,3 +80,12 @@ pattern = "https://trusted.example.com/k8s"
 org_id = "123456789012345678"
 # Optional per-grant token lifetime.
 duration = "12h"
+
+# A client that needs more than its own project, e.g. reading users across
+# all organisations. instance_roles are only allowed for an exact issuer (no
+# wildcards) and require zitadel.key_file to belong to an IAM_OWNER.
+#
+# [[grants]]
+# pattern = "https://central.example.com/k8s"
+# org_id = "123456789012345678"
+# instance_roles = ["IAM_OWNER_VIEWER"]

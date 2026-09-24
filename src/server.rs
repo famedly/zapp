@@ -198,18 +198,20 @@ async fn issue_credentials(
 			&issuer,
 			&entitlement.org_id,
 			entitlement.duration,
+			&entitlement.instance_roles,
 			query.credential_type,
 		)
 		.await
 		.map_err(ApiError::Zitadel)?;
 
 	info!(
-		"issued {:?} for service account {} ({}) owning project {} in org {} for issuer {issuer} (expires_at {})",
+		"issued {:?} for service account {} ({}) owning project {} in org {} with instance roles {:?} for issuer {issuer} (expires_at {})",
 		query.credential_type,
 		provisioned.username,
 		provisioned.user_id,
 		provisioned.project_id,
 		entitlement.org_id,
+		entitlement.instance_roles,
 		provisioned.expires_at
 	);
 	let (secret, key) = match provisioned.credential {
