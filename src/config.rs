@@ -115,6 +115,14 @@ pub struct GrantConfig {
 	/// `zitadel.default_duration` when unset.
 	#[serde(default, with = "humantime_serde::option")]
 	pub duration: Option<Duration>,
+	/// Roles the service account additionally holds on the whole Zitadel
+	/// instance, e.g. `["IAM_OWNER_VIEWER"]` for a client that must read
+	/// users across all organisations. Empty by default: the account only
+	/// owns its project. Since these reach across every organisation, they
+	/// are only allowed for an exact issuer (a pattern without wildcards),
+	/// and zapp's own service user then needs `IAM_OWNER`.
+	#[serde(default)]
+	pub instance_roles: Vec<String>,
 }
 
 impl Config {
@@ -189,6 +197,20 @@ impl Config {
 			}
 			if grant.duration.is_some_and(|duration| duration.is_zero()) {
 				anyhow::bail!("grant pattern {:?}: duration must be positive", grant.pattern);
+			}
+			if !grant.instance_roles.is_empty() && grant.pattern.contains('*') {
+				anyhow::bail!(
+					"grant pattern {:?} has instance_roles, which are only allowed for an exact issuer without wildcards",
+					grant.pattern
+				);
+			}
+			if let Some(role) = grant.instance_roles.iter().find(|role| {
+				role.is_empty() || !role.chars().all(|c| c.is_ascii_uppercase() || c == '_')
+			}) {
+				anyhow::bail!(
+					"grant pattern {:?} has invalid instance role {role:?}: Zitadel roles look like IAM_OWNER_VIEWER",
+					grant.pattern
+				);
 			}
 		}
 		validate_account_prefix(
@@ -345,6 +367,23 @@ org_id = "123456789012345678"
 		assert!(gc("12h", "36h").is_err(), "soft shorter than default_duration");
 		assert!(gc("0s", "36h").is_err());
 		assert!(parse(MINIMAL).expect("valid config").gc.is_none());
+	}
+
+	#[test]
+	fn instance_roles_require_an_exact_issuer() {
+		let config = parse(&(MINIMAL.to_string() + "instance_roles = [\"IAM_OWNER_VIEWER\"]\n"))
+			.expect("valid config");
+		assert_eq!(config.grants[0].instance_roles, ["IAM_OWNER_VIEWER"]);
+		assert!(parse(MINIMAL).expect("valid config").grants[0].instance_roles.is_empty());
+
+		let wildcard = MINIMAL
+			.replace("https://trusted.example.com/k8s", "https://*.example.com/k8s")
+			+ "instance_roles = [\"IAM_OWNER_VIEWER\"]\n";
+		assert!(parse(&wildcard).is_err(), "wildcard pattern with instance roles");
+		for role in ["", "iam_owner", "IAM OWNER"] {
+			let toml = MINIMAL.to_string() + &format!("instance_roles = [\"{role}\"]\n");
+			assert!(parse(&toml).is_err(), "role {role:?} should be rejected");
+		}
 	}
 
 	#[test]

@@ -13,6 +13,8 @@ use crate::{config::GrantConfig, pattern::pattern_matches};
 pub struct Entitlement {
 	pub org_id: String,
 	pub duration: Duration,
+	/// Roles on the whole Zitadel instance, on top of owning the project.
+	pub instance_roles: Vec<String>,
 }
 
 /// Resolves a verified issuer origin (scheme + domain + port) and path to
@@ -57,6 +59,7 @@ impl PermissionResolver for StaticResolver {
 			.map(|grant| Entitlement {
 				org_id: grant.org_id.clone(),
 				duration: grant.duration.unwrap_or(self.default_duration),
+				instance_roles: grant.instance_roles.clone(),
 			})
 	}
 }
