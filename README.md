@@ -185,8 +185,11 @@ garbage collection. Two ways out:
   organisation to a member from the home organisation (Zitadel accepts org
   members from other organisations). An account can write the users of the
   organisation it acts on, but not those of the home organisation, so zapp's
-  metadata stays out of its reach. Do not give any account user-writing roles on
-  the home organisation itself.
+  metadata stays out of its reach. zapp therefore refuses to start if a grant
+  with `org_roles` names the home organisation as its `org_id`. Accounts created
+  before a home organisation was configured stay in their grant's organisation
+  until garbage collection removes them; the next request creates a new pair in
+  the home organisation.
 - Without a home organisation, only grant such roles in an organisation whose
   users and projects all belong to the party the account acts for (e.g. one
   tenant).

@@ -32,7 +32,8 @@ default_duration = "24h"
 # is created in this organisation, and org_roles are granted on the grant's
 # org_id to a member from here. Recommended with org_roles that can write
 # users (e.g. ORG_USER_MANAGER): such an account can then not touch zapp's
-# metadata, which lives in the home organisation. Unset: accounts and
+# metadata, which lives in the home organisation (so no grant with org_roles
+# may name it as org_id). Unset: accounts and
 # projects live in the grant's org_id.
 # account_org_id = "999999999999999999"
 

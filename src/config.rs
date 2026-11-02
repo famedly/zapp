@@ -270,6 +270,17 @@ impl Config {
 					grant.pattern
 				);
 			}
+			if !grant.org_roles.is_empty()
+				&& self.zitadel.account_org_id.as_ref() == Some(&grant.org_id)
+			{
+				//= docs/requirements/zapp.md#home-org-1
+				//# zapp MUST refuse to start if a grant names organisation
+				//# roles and its organisation is the home organisation.
+				anyhow::bail!(
+					"grant pattern {:?} has org_roles on the home organisation zitadel.account_org_id: they would let the account reach zapp's metadata",
+					grant.pattern
+				);
+			}
 			if let Some(role) = grant.org_roles.iter().find(|role| {
 				role.len() <= "ORG_".len()
 					|| !role.starts_with("ORG_")
@@ -556,6 +567,24 @@ org_id = "123456789012345678"
 		//# numeric.
 		assert!(with_home("").is_err());
 		assert!(with_home("home").is_err());
+
+		//= docs/requirements/zapp.md#home-org-1
+		//= type=test
+		//# zapp MUST refuse to start if a grant names organisation roles and
+		//# its organisation is the home organisation.
+		let roles_on = |home: &str| {
+			parse(
+				&(MINIMAL.replace(
+					"key_file = \"/run/secrets/zapp-key.json\"",
+					&format!(
+						"key_file = \"/run/secrets/zapp-key.json\"\naccount_org_id = \"{home}\""
+					),
+				) + "org_roles = [\"ORG_USER_MANAGER\"]\n"),
+			)
+		};
+		assert!(roles_on("123456789012345678").is_err(), "org roles on the home org");
+		assert!(roles_on("999").is_ok());
+		assert!(with_home("123456789012345678").is_ok(), "home org without org roles");
 	}
 
 	#[test]
