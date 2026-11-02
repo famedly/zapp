@@ -1,11 +1,11 @@
 SPECIFICATION: [zapp requirements](docs/requirements/zapp.md)
   SECTION: [ORG-ROLES-1](#org-roles-1)
-    TEXT[!MUST]: If the matching grant names organisation roles, zapp MUST make the service account a member of the grant's organisation with exactly these roles.
-    TEXT[!MUST]: If the service account already is a member of that organisation, zapp MUST replace its roles there with the grant's organisation roles.
+    TEXT[!MUST,implementation,test]: If the matching grant names organisation roles, zapp MUST make the service account a member of the grant's organisation with exactly these roles.
+    TEXT[!MUST,implementation,test]: If the service account already is a member of that organisation, zapp MUST replace its roles there with the grant's organisation roles.
 
   SECTION: [ORG-ROLES-2](#org-roles-2)
-    TEXT[!MUST]: zapp MUST refuse to start if an organisation role of a grant does not start with ORG\_ or contains characters other than upper-case letters and underscores.
-    TEXT[!MUST]: zapp MUST refuse to start if a grant names organisation roles and its issuer pattern contains a wildcard.
+    TEXT[!MUST,implementation,test]: zapp MUST refuse to start if an organisation role of a grant does not start with ORG_ or contains characters other than upper-case letters and underscores.
+    TEXT[!MUST,implementation,test]: zapp MUST refuse to start if a grant names organisation roles and its issuer pattern contains a wildcard.
 
   SECTION: [SUBJECT-1](#subject-1)
     TEXT[!MUST]: A grant with a subject pattern MUST match a token only if the verified subject of the token matches the subject pattern.

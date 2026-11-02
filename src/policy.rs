@@ -15,6 +15,8 @@ pub struct Entitlement {
 	pub duration: Duration,
 	/// Roles on the whole Zitadel instance, on top of owning the project.
 	pub instance_roles: Vec<String>,
+	/// Roles on the organisation `org_id`, on top of owning the project.
+	pub org_roles: Vec<String>,
 }
 
 /// Resolves a verified issuer origin (scheme + domain + port) and path to
@@ -60,6 +62,7 @@ impl PermissionResolver for StaticResolver {
 				org_id: grant.org_id.clone(),
 				duration: grant.duration.unwrap_or(self.default_duration),
 				instance_roles: grant.instance_roles.clone(),
+				org_roles: grant.org_roles.clone(),
 			})
 	}
 }

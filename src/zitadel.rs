@@ -30,7 +30,7 @@ use time::{OffsetDateTime, format_description::well_known::Rfc3339};
 use tracing::info;
 use url::Url;
 
-use crate::config::ZitadelConfig;
+use crate::{config::ZitadelConfig, policy::Entitlement};
 
 /// Administrator role of a user on a project.
 const PROJECT_OWNER: &str = "PROJECT_OWNER";
@@ -207,10 +207,11 @@ impl ZitadelClient {
 		&self.url
 	}
 
-	/// Ensures that in organisation `org_id` an active project `name` and
-	/// an active service account `name` exist, that the service account
-	/// records itself as creator of the project (metadata), owns it and
-	/// holds exactly `instance_roles` on the instance (if any), and issues a
+	/// Ensures that in the entitlement's organisation `org_id` an active
+	/// project `name` and an active service account `name` exist, that the
+	/// service account records itself as creator of the project (metadata),
+	/// owns it and holds exactly `instance_roles` on the instance and
+	/// `org_roles` on organisation `org_id` (each if any), and issues a
 	/// credential of the requested kind valid for `duration`.
 	///
 	/// Both are created optimistically and adopted (reactivated if needed)
@@ -222,11 +223,11 @@ impl ZitadelClient {
 		&self,
 		name: &str,
 		issuer: &str,
-		org_id: &str,
-		duration: Duration,
-		instance_roles: &[String],
+		entitlement: &Entitlement,
 		credential_type: CredentialType,
 	) -> anyhow::Result<Provisioned> {
+		let Entitlement { org_id, duration, instance_roles, org_roles, .. } = entitlement;
+		let org_id = org_id.as_str();
 		let project_id = self.ensure_project(name, org_id).await?;
 		let user_id = self.ensure_service_account(name, issuer, org_id, &project_id).await?;
 		self.ensure_project_owner(org_id, &project_id, &user_id).await?;
@@ -236,8 +237,13 @@ impl ZitadelClient {
 		if !instance_roles.is_empty() {
 			self.ensure_instance_member(&user_id, instance_roles).await?;
 		}
+		// shortcut: like instance_roles, removed org_roles stay until GC
+		// deletes the account.
+		if !org_roles.is_empty() {
+			self.ensure_org_member(org_id, &user_id, org_roles).await?;
+		}
 
-		let expires_at = (OffsetDateTime::now_utc() + duration)
+		let expires_at = (OffsetDateTime::now_utc() + *duration)
 			.format(&Rfc3339)
 			.context("formatting credential expiry")?;
 		let credential = match credential_type {
@@ -429,6 +435,51 @@ impl ZitadelClient {
 			// Zitadel rejects an update that changes nothing.
 			Err(e) if has_status(&e, StatusCode::PRECONDITION_FAILED) => Ok(()),
 			Err(e) => Err(e.context("updating instance roles of service account")),
+		}
+	}
+
+	/// Makes the service account a member of organisation `org_id` with
+	/// exactly `roles`, overwriting whatever roles it held there before.
+	async fn ensure_org_member(
+		&self,
+		org_id: &str,
+		user_id: &str,
+		roles: &[String],
+	) -> anyhow::Result<()> {
+		//= docs/requirements/zapp.md#org-roles-1
+		//# If the matching grant names organisation roles, zapp MUST make the
+		//# service account a member of the grant's organisation with exactly
+		//# these roles.
+		match self
+			.call::<IgnoredAny>(
+				Method::POST,
+				"orgs/me/members",
+				org_id,
+				Some(json!({ "userId": user_id, "roles": roles })),
+			)
+			.await
+		{
+			Ok(_) => return Ok(()),
+			Err(e) if has_status(&e, StatusCode::CONFLICT) => {}
+			Err(e) => return Err(e.context("making service account an organisation member")),
+		}
+		//= docs/requirements/zapp.md#org-roles-1
+		//# If the service account already is a member of that organisation,
+		//# zapp MUST replace its roles there with the grant's organisation
+		//# roles.
+		match self
+			.call::<IgnoredAny>(
+				Method::PUT,
+				&format!("orgs/me/members/{user_id}"),
+				org_id,
+				Some(json!({ "roles": roles })),
+			)
+			.await
+		{
+			Ok(_) => Ok(()),
+			// Zitadel rejects an update that changes nothing.
+			Err(e) if has_status(&e, StatusCode::PRECONDITION_FAILED) => Ok(()),
+			Err(e) => Err(e.context("updating organisation roles of service account")),
 		}
 	}
 
@@ -814,7 +865,141 @@ impl ZitadelClient {
 
 #[cfg(test)]
 mod tests {
+	use aws_lc_rs::{
+		encoding::{AsDer, Pkcs8V1Der},
+		rsa::{KeyPair, KeySize},
+	};
+	use wiremock::{
+		Mock, MockServer, ResponseTemplate,
+		matchers::{body_json, header, method, path},
+	};
+
 	use super::*;
+
+	const ORG_ID: &str = "123456789012345678";
+	const USER_ID: &str = "312909075212345678";
+
+	/// A client talking to `server`, authenticated with a freshly generated
+	/// service user key against a mocked token endpoint.
+	async fn test_client(server: &MockServer) -> ZitadelClient {
+		Mock::given(method("POST"))
+			.and(path("/oauth/v2/token"))
+			.respond_with(ResponseTemplate::new(200).set_body_json(json!({
+				"access_token": "test-token",
+				"token_type": "Bearer",
+				"expires_in": 3600,
+			})))
+			.mount(server)
+			.await;
+
+		let key = KeyPair::generate(KeySize::Rsa2048).expect("generating RSA key");
+		let der = AsDer::<Pkcs8V1Der>::as_der(&key).expect("encoding key");
+		let pem = format!(
+			"-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
+			BASE64_STANDARD.encode(der.as_ref())
+		);
+		let key_file = std::env::temp_dir().join(format!(
+			"zapp-test-key-{}-{}.json",
+			std::process::id(),
+			OffsetDateTime::now_utc().unix_timestamp_nanos()
+		));
+		let key_json = json!({ "type": "serviceaccount", "keyId": "1", "key": pem, "userId": "1" });
+		std::fs::write(&key_file, key_json.to_string()).expect("writing key file");
+
+		let config = ZitadelConfig {
+			url: format!("{}/", server.uri()).parse().expect("mock server URL"),
+			key_file: key_file.clone(),
+			account_prefix_https: "zapp/".to_string(),
+			account_prefix_http: None,
+			default_duration: Duration::from_secs(3600),
+		};
+		let client = ZitadelClient::new(&config).await.expect("connecting to mock Zitadel");
+		std::fs::remove_file(key_file).ok();
+		client
+	}
+
+	fn roles() -> Vec<String> {
+		vec!["ORG_USER_MANAGER".to_string()]
+	}
+
+	#[tokio::test]
+	async fn adds_org_member_with_exactly_the_roles() {
+		let server = MockServer::start().await;
+		let client = test_client(&server).await;
+		Mock::given(method("POST"))
+			.and(path("/management/v1/orgs/me/members"))
+			.and(header(HEADER_ZITADEL_ORGANIZATION_ID, ORG_ID))
+			.and(body_json(json!({ "userId": USER_ID, "roles": ["ORG_USER_MANAGER"] })))
+			.respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+			.expect(1)
+			.mount(&server)
+			.await;
+
+		//= docs/requirements/zapp.md#org-roles-1
+		//= type=test
+		//# If the matching grant names organisation roles, zapp MUST make the
+		//# service account a member of the grant's organisation with exactly
+		//# these roles.
+		client.ensure_org_member(ORG_ID, USER_ID, &roles()).await.expect("org member added");
+	}
+
+	#[tokio::test]
+	async fn overwrites_roles_of_an_existing_org_member() {
+		let server = MockServer::start().await;
+		let client = test_client(&server).await;
+		Mock::given(method("POST"))
+			.and(path("/management/v1/orgs/me/members"))
+			.respond_with(ResponseTemplate::new(409).set_body_json(json!({ "code": 6 })))
+			.expect(1)
+			.mount(&server)
+			.await;
+		Mock::given(method("PUT"))
+			.and(path(format!("/management/v1/orgs/me/members/{USER_ID}")))
+			.and(header(HEADER_ZITADEL_ORGANIZATION_ID, ORG_ID))
+			.and(body_json(json!({ "roles": ["ORG_USER_MANAGER"] })))
+			.respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+			.expect(1)
+			.mount(&server)
+			.await;
+
+		//= docs/requirements/zapp.md#org-roles-1
+		//= type=test
+		//# If the service account already is a member of that organisation,
+		//# zapp MUST replace its roles there with the grant's organisation
+		//# roles.
+		client.ensure_org_member(ORG_ID, USER_ID, &roles()).await.expect("org roles replaced");
+	}
+
+	#[tokio::test]
+	async fn unchanged_org_member_is_fine() {
+		let server = MockServer::start().await;
+		let client = test_client(&server).await;
+		Mock::given(method("POST"))
+			.and(path("/management/v1/orgs/me/members"))
+			.respond_with(ResponseTemplate::new(409))
+			.mount(&server)
+			.await;
+		// Zitadel rejects an update that changes nothing.
+		Mock::given(method("PUT"))
+			.and(path(format!("/management/v1/orgs/me/members/{USER_ID}")))
+			.respond_with(ResponseTemplate::new(412))
+			.expect(1)
+			.mount(&server)
+			.await;
+		client.ensure_org_member(ORG_ID, USER_ID, &roles()).await.expect("nothing to change");
+	}
+
+	#[tokio::test]
+	async fn org_member_errors_surface() {
+		let server = MockServer::start().await;
+		let client = test_client(&server).await;
+		Mock::given(method("POST"))
+			.and(path("/management/v1/orgs/me/members"))
+			.respond_with(ResponseTemplate::new(403))
+			.mount(&server)
+			.await;
+		assert!(client.ensure_org_member(ORG_ID, USER_ID, &roles()).await.is_err());
+	}
 
 	#[test]
 	fn creator_ids_are_numeric_only() {

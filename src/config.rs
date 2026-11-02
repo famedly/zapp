@@ -123,6 +123,12 @@ pub struct GrantConfig {
 	/// and zapp's own service user then needs `IAM_OWNER`.
 	#[serde(default)]
 	pub instance_roles: Vec<String>,
+	/// Roles the service account holds on the grant's organisation
+	/// (`org_id`), e.g. `["ORG_USER_MANAGER"]` for a client that manages the
+	/// users of its organisation. Empty by default. Only allowed for an exact
+	/// issuer, like `instance_roles`.
+	#[serde(default)]
+	pub org_roles: Vec<String>,
 }
 
 impl Config {
@@ -209,6 +215,29 @@ impl Config {
 			}) {
 				anyhow::bail!(
 					"grant pattern {:?} has invalid instance role {role:?}: Zitadel roles look like IAM_OWNER_VIEWER",
+					grant.pattern
+				);
+			}
+			if !grant.org_roles.is_empty() && grant.pattern.contains('*') {
+				//= docs/requirements/zapp.md#org-roles-2
+				//# zapp MUST refuse to start if a grant names organisation
+				//# roles and its issuer pattern contains a wildcard.
+				anyhow::bail!(
+					"grant pattern {:?} has org_roles, which are only allowed for an exact issuer without wildcards",
+					grant.pattern
+				);
+			}
+			if let Some(role) = grant.org_roles.iter().find(|role| {
+				role.len() <= "ORG_".len()
+					|| !role.starts_with("ORG_")
+					|| !role.chars().all(|c| c.is_ascii_uppercase() || c == '_')
+			}) {
+				//= docs/requirements/zapp.md#org-roles-2
+				//# zapp MUST refuse to start if an organisation role of a grant
+				//# does not start with ORG_ or contains characters other than
+				//# upper-case letters and underscores.
+				anyhow::bail!(
+					"grant pattern {:?} has invalid org role {role:?}: Zitadel organisation roles look like ORG_USER_MANAGER",
 					grant.pattern
 				);
 			}
@@ -382,6 +411,36 @@ org_id = "123456789012345678"
 		assert!(parse(&wildcard).is_err(), "wildcard pattern with instance roles");
 		for role in ["", "iam_owner", "IAM OWNER"] {
 			let toml = MINIMAL.to_string() + &format!("instance_roles = [\"{role}\"]\n");
+			assert!(parse(&toml).is_err(), "role {role:?} should be rejected");
+		}
+	}
+
+	#[test]
+	fn org_roles_require_an_exact_issuer() {
+		let config = parse(&(MINIMAL.to_string() + "org_roles = [\"ORG_USER_MANAGER\"]\n"))
+			.expect("valid config");
+		assert_eq!(config.grants[0].org_roles, ["ORG_USER_MANAGER"]);
+		assert!(parse(MINIMAL).expect("valid config").grants[0].org_roles.is_empty());
+
+		//= docs/requirements/zapp.md#org-roles-2
+		//= type=test
+		//# zapp MUST refuse to start if a grant names organisation roles and
+		//# its issuer pattern contains a wildcard.
+		let wildcard = MINIMAL
+			.replace("https://trusted.example.com/k8s", "https://*.example.com/k8s")
+			+ "org_roles = [\"ORG_USER_MANAGER\"]\n";
+		assert!(parse(&wildcard).is_err(), "wildcard pattern with org roles");
+	}
+
+	#[test]
+	fn rejects_invalid_org_roles() {
+		//= docs/requirements/zapp.md#org-roles-2
+		//= type=test
+		//# zapp MUST refuse to start if an organisation role of a grant does
+		//# not start with ORG_ or contains characters other than upper-case
+		//# letters and underscores.
+		for role in ["", "ORG_", "org_user_manager", "ORG USER", "IAM_OWNER", "PROJECT_OWNER"] {
+			let toml = MINIMAL.to_string() + &format!("org_roles = [\"{role}\"]\n");
 			assert!(parse(&toml).is_err(), "role {role:?} should be rejected");
 		}
 	}
