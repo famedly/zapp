@@ -67,3 +67,31 @@ zapp MUST reject a subject if the resulting name would be longer than 200 charac
 ### SUBJECT-4
 
 zapp MUST pass the verified subject to the permission resolver.
+
+## Verification
+
+### CA-1
+
+If a CA bundle is configured, zapp MUST trust its certificates for discovery, introspection and JWKS requests, in addition to the system's trusted roots.
+
+zapp MUST refuse to start if the configured CA bundle cannot be read or contains no certificate.
+
+## Accounts
+
+### AUDIT-1
+
+zapp MUST record the verified issuer in the metadata of the service account, and for a subject-scoped grant also the verified subject.
+
+zapp MUST NOT use the recorded subject to recognise, adopt or garbage collect service accounts.
+
+### HOME-ORG-1
+
+If no home organisation is configured, zapp MUST create the service account and the project in the grant's organisation.
+
+If a home organisation is configured, zapp MUST create the service account and the project in the home organisation instead of the grant's organisation.
+
+If a home organisation is configured, zapp MUST give the service account its organisation roles on the grant's organisation.
+
+If a home organisation is configured, garbage collection MUST include the home organisation.
+
+zapp MUST refuse to start if the home organisation ID is not numeric.
