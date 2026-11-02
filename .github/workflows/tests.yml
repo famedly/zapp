@@ -4,6 +4,16 @@ concurrency:
   cancel-in-progress: true
   group: ${{ github.workflow }}-${{ github.ref }}
 jobs:
+  duvet:
+    runs-on: ubuntu-26.04-arm
+    steps:
+      - uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10
+      - uses: cachix/install-nix-action@8aa03977d8d733052d78f4e008a241fd1dbf36b3
+      - name: Check requirements coverage
+        run: |
+          cargo install duvet --version 0.4.3 --locked --root "$RUNNER_TEMP/duvet"
+          "$RUNNER_TEMP/duvet/bin/duvet" report --ci
+        shell: nix develop .#rust --command bash {0}
   nextest:
     runs-on: ubuntu-26.04-arm
     steps:

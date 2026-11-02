@@ -40,5 +40,25 @@ in
         }
       ];
     };
+
+    # Requirements in docs/requirements are traced to code and tests with
+    # Duvet; this fails if .duvet/snapshot.txt is out of date.
+    jobs.duvet = {
+      runsOn = "ubuntu-26.04-arm";
+
+      steps = [
+        { uses = allowed-actions."actions/checkout".uses; }
+        { uses = allowed-actions."cachix/install-nix-action".uses; }
+
+        {
+          name = "Check requirements coverage";
+          shell = "nix develop .#rust --command bash {0}";
+          run = ''
+            cargo install duvet --version 0.4.3 --locked --root "$RUNNER_TEMP/duvet"
+            "$RUNNER_TEMP/duvet/bin/duvet" report --ci
+          '';
+        }
+      ];
+    };
   };
 }
