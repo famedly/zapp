@@ -110,6 +110,7 @@ enum ApiError {
 	MissingBearer,
 	Verify(VerifyError),
 	NotEntitled(String),
+	SubjectNotUsable(String),
 	Zitadel(anyhow::Error),
 }
 
@@ -145,6 +146,13 @@ impl IntoResponse for ApiError {
 				"issuer_not_entitled",
 				format!("issuer {issuer} does not match any configured pattern"),
 			),
+			ApiError::SubjectNotUsable(subject) => (
+				StatusCode::FORBIDDEN,
+				"subject_not_usable",
+				format!(
+					"subject {subject:?} gives a service account name longer than 200 characters"
+				),
+			),
 			ApiError::Zitadel(e) => {
 				warn!("zitadel error: {e:#}");
 				(
@@ -176,9 +184,17 @@ async fn issue_credentials(
 	})?;
 	let issuer = claims.issuer_url();
 
+	//= docs/requirements/zapp.md#subject-4
+	//# zapp MUST pass the verified subject to the permission resolver.
 	let entitlement = state
 		.resolver
-		.resolve(&claims.scheme, &claims.domain, claims.port, &claims.path)
+		.resolve(
+			&claims.scheme,
+			&claims.domain,
+			claims.port,
+			&claims.path,
+			claims.subject.as_deref(),
+		)
 		.ok_or_else(|| ApiError::NotEntitled(issuer.clone()))?;
 
 	// The verifier already rejects http issuers when no http prefix is
@@ -191,14 +207,29 @@ async fn issue_credentials(
 		_ => state.account_prefix_https.as_str(),
 	};
 
+	let name = match &entitlement.subject {
+		//= docs/requirements/zapp.md#subject-3
+		//# If the matching grant has a subject pattern, the names of the
+		//# service account and the project MUST contain the subject, so that
+		//# every pair of issuer and subject gets its own service account and
+		//# project.
+		Some(subject) => claims
+			.subject_account_name(prefix, subject)
+			.ok_or_else(|| ApiError::SubjectNotUsable(subject.clone()))?,
+		//= docs/requirements/zapp.md#subject-3
+		//# If the matching grant has no subject pattern, the names MUST stay
+		//# the same as without subject support.
+		None => claims.account_name(prefix),
+	};
+
 	let provisioned = state
 		.zitadel
-		.provision(&claims.account_name(prefix), &issuer, &entitlement, query.credential_type)
+		.provision(&name, &issuer, &entitlement, query.credential_type)
 		.await
 		.map_err(ApiError::Zitadel)?;
 
 	info!(
-		"issued {:?} for service account {} ({}) owning project {} in org {} with instance roles {:?} and org roles {:?} for issuer {issuer} (expires_at {})",
+		"issued {:?} for service account {} ({}) owning project {} in org {} with instance roles {:?} and org roles {:?} for issuer {issuer} subject {:?} (expires_at {})",
 		query.credential_type,
 		provisioned.username,
 		provisioned.user_id,
@@ -206,6 +237,7 @@ async fn issue_credentials(
 		entitlement.org_id,
 		entitlement.instance_roles,
 		entitlement.org_roles,
+		entitlement.subject,
 		provisioned.expires_at
 	);
 	let (secret, key) = match provisioned.credential {
@@ -237,4 +269,150 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 		.strip_prefix("Bearer ")
 		.map(str::trim)
 		.filter(|t| !t.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+	use std::sync::Mutex;
+
+	use axum::body::Body;
+	use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
+	use serde_json::json;
+	use tower::ServiceExt as _;
+	use wiremock::{
+		Mock, MockServer, ResponseTemplate,
+		matchers::{body_partial_json, method, path, path_regex},
+	};
+
+	use super::*;
+	use crate::{
+		config::VerificationConfig,
+		policy::{Entitlement, PermissionResolver},
+		zitadel::tests::test_client,
+	};
+
+	/// Entitles every caller to org 1 with per-subject accounts and records
+	/// the subject it was asked about.
+	#[derive(Default)]
+	struct RecordingResolver {
+		subjects: Arc<Mutex<Vec<Option<String>>>>,
+	}
+
+	impl PermissionResolver for RecordingResolver {
+		fn resolve(
+			&self,
+			_scheme: &str,
+			_domain: &str,
+			_port: Option<u16>,
+			_path: &str,
+			subject: Option<&str>,
+		) -> Option<Entitlement> {
+			self.subjects.lock().unwrap().push(subject.map(str::to_string));
+			Some(Entitlement {
+				org_id: "1".to_string(),
+				duration: std::time::Duration::from_secs(3600),
+				instance_roles: Vec::new(),
+				org_roles: vec!["ORG_USER_MANAGER".to_string()],
+				subject: subject.map(str::to_string),
+			})
+		}
+	}
+
+	#[tokio::test]
+	async fn issues_per_subject_credentials() {
+		let subject = "system:serviceaccount:tenant-a:admin-api";
+
+		// The workload's issuer, verifying tokens by introspection.
+		let issuer = MockServer::start().await;
+		let iss = issuer.uri();
+		Mock::given(method("GET"))
+			.and(path("/.well-known/openid-configuration"))
+			.respond_with(ResponseTemplate::new(200).set_body_json(json!({
+				"issuer": iss,
+				"introspection_endpoint": format!("{iss}/introspect"),
+			})))
+			.mount(&issuer)
+			.await;
+		Mock::given(method("POST"))
+			.and(path("/introspect"))
+			.respond_with(
+				ResponseTemplate::new(200).set_body_json(json!({ "active": true, "sub": subject })),
+			)
+			.mount(&issuer)
+			.await;
+
+		// Zitadel, on the happy path where nothing exists yet.
+		let zitadel = MockServer::start().await;
+		let client = test_client(&zitadel).await;
+		let name = format!("zapp-insecure/{}#{subject}", iss.trim_start_matches("http://"));
+		Mock::given(method("POST"))
+			.and(path("/management/v1/projects"))
+			.and(body_partial_json(json!({ "name": name })))
+			.respond_with(ResponseTemplate::new(200).set_body_json(json!({ "id": "10" })))
+			.expect(1)
+			.mount(&zitadel)
+			.await;
+		Mock::given(method("POST"))
+			.and(path("/management/v1/users/machine"))
+			.and(body_partial_json(json!({ "userName": name })))
+			.respond_with(ResponseTemplate::new(200).set_body_json(json!({ "userId": "20" })))
+			.expect(1)
+			.mount(&zitadel)
+			.await;
+		Mock::given(method("POST"))
+			.and(path_regex("^/management/v1/(users/20/metadata/_bulk|projects/10/members)$"))
+			.respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+			.mount(&zitadel)
+			.await;
+		Mock::given(method("POST"))
+			.and(path("/management/v1/orgs/me/members"))
+			.and(body_partial_json(json!({ "userId": "20", "roles": ["ORG_USER_MANAGER"] })))
+			.respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+			.expect(1)
+			.mount(&zitadel)
+			.await;
+		Mock::given(method("POST"))
+			.and(path("/management/v1/users/20/pats"))
+			.respond_with(ResponseTemplate::new(200).set_body_json(json!({ "token": "pat" })))
+			.mount(&zitadel)
+			.await;
+
+		let resolver = RecordingResolver::default();
+		let subjects = resolver.subjects.clone();
+		let state = Arc::new(AppState {
+			verifier: DomainVerifier::new(
+				&VerificationConfig { audience: "zapp".to_string(), timeout_secs: 5 },
+				true,
+			)
+			.unwrap(),
+			resolver: Box::new(resolver),
+			zitadel: Arc::new(client),
+			account_prefix_https: "zapp/".to_string(),
+			account_prefix_http: Some("zapp-insecure/".to_string()),
+		});
+		// Unsigned: introspection vouches for it. The payload's own sub is
+		// ignored.
+		let payload = json!({ "iss": iss, "aud": "zapp", "sub": "from-payload" });
+		let token = format!(
+			"{}.{}.signature",
+			URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","typ":"JWT"}"#),
+			URL_SAFE_NO_PAD.encode(payload.to_string())
+		);
+		let request = axum::http::Request::post("/v1/credentials")
+			.header(header::AUTHORIZATION, format!("Bearer {token}"))
+			.body(Body::empty())
+			.unwrap();
+
+		let response = router(state).oneshot(request).await.unwrap();
+		let status = response.status();
+		let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		assert_eq!(status, StatusCode::OK, "{}", String::from_utf8_lossy(&body));
+		let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+		assert_eq!(body["username"], name);
+
+		//= docs/requirements/zapp.md#subject-4
+		//= type=test
+		//# zapp MUST pass the verified subject to the permission resolver.
+		assert_eq!(*subjects.lock().unwrap(), [Some(subject.to_string())]);
+	}
 }

@@ -129,6 +129,14 @@ pub struct GrantConfig {
 	/// issuer, like `instance_roles`.
 	#[serde(default)]
 	pub org_roles: Vec<String>,
+	/// Pattern over the token subject (`sub`), e.g.
+	/// "system:serviceaccount:tenant-a:*". When set, the grant only matches
+	/// tokens whose verified subject matches, and every issuer and subject
+	/// pair gets its own service account and project. Matched segment by
+	/// segment at ':' like issuer paths ('*' once per segment, "**" as its own
+	/// segment for any number of segments).
+	#[serde(default)]
+	pub subject: Option<String>,
 }
 
 impl Config {
@@ -218,6 +226,17 @@ impl Config {
 					grant.pattern
 				);
 			}
+			if let Some(subject) = &grant.subject
+				&& let Err(reason) = crate::pattern::validate_subject_pattern(subject)
+			{
+				//= docs/requirements/zapp.md#subject-1
+				//# zapp MUST refuse to start if a subject pattern is empty or
+				//# contains an invalid wildcard.
+				anyhow::bail!(
+					"grant pattern {:?} has invalid subject pattern {subject:?}: {reason}",
+					grant.pattern
+				);
+			}
 			if !grant.org_roles.is_empty() && grant.pattern.contains('*') {
 				//= docs/requirements/zapp.md#org-roles-2
 				//# zapp MUST refuse to start if a grant names organisation
@@ -258,12 +277,17 @@ impl Config {
 	}
 }
 
-/// Service account names are "<prefix><host>[:<port>][/<path>]". The
-/// prefix must not contain '@' (Zitadel treats it as the login name
-/// separator) or whitespace.
+/// Service account names are "<prefix><host>[:<port>][/<path>]", followed
+/// by "#<subject>" for subject-scoped grants. The prefix must not contain '@'
+/// (Zitadel treats it as the login name separator), '#' (it separates the
+/// subject) or whitespace.
 fn validate_account_prefix(key: &str, prefix: &str) -> anyhow::Result<()> {
-	if prefix.is_empty() || prefix.contains('@') || prefix.chars().any(char::is_whitespace) {
-		anyhow::bail!("{key} {prefix:?} must be non-empty and contain no '@' or whitespace");
+	if prefix.is_empty()
+		|| prefix.contains('@')
+		|| prefix.contains('#')
+		|| prefix.chars().any(char::is_whitespace)
+	{
+		anyhow::bail!("{key} {prefix:?} must be non-empty and contain no '@', '#' or whitespace");
 	}
 	Ok(())
 }
@@ -370,7 +394,7 @@ org_id = "123456789012345678"
 
 	#[test]
 	fn rejects_bad_prefixes() {
-		for prefix in ["", "za pp", "za@pp"] {
+		for prefix in ["", "za pp", "za@pp", "za#pp"] {
 			let toml = MINIMAL.replace(
 				"key_file = \"/run/secrets/zapp-key.json\"",
 				&format!(
@@ -442,6 +466,24 @@ org_id = "123456789012345678"
 		for role in ["", "ORG_", "org_user_manager", "ORG USER", "IAM_OWNER", "PROJECT_OWNER"] {
 			let toml = MINIMAL.to_string() + &format!("org_roles = [\"{role}\"]\n");
 			assert!(parse(&toml).is_err(), "role {role:?} should be rejected");
+		}
+	}
+
+	#[test]
+	fn subject_patterns() {
+		let config =
+			parse(&(MINIMAL.to_string() + "subject = \"system:serviceaccount:tenant-a:*\"\n"))
+				.expect("valid config");
+		assert_eq!(config.grants[0].subject.as_deref(), Some("system:serviceaccount:tenant-a:*"));
+		assert_eq!(parse(MINIMAL).expect("valid config").grants[0].subject, None);
+
+		//= docs/requirements/zapp.md#subject-1
+		//= type=test
+		//# zapp MUST refuse to start if a subject pattern is empty or contains
+		//# an invalid wildcard.
+		for subject in ["", "a**b", "a::b", "*a*"] {
+			let toml = MINIMAL.to_string() + &format!("subject = \"{subject}\"\n");
+			assert!(parse(&toml).is_err(), "subject {subject:?} should be rejected");
 		}
 	}
 

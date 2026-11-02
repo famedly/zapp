@@ -4,7 +4,10 @@
 
 use std::time::Duration;
 
-use crate::{config::GrantConfig, pattern::pattern_matches};
+use crate::{
+	config::GrantConfig,
+	pattern::{pattern_matches, subject_matches},
+};
 
 /// The entitlement resolved for a verified issuer: the Zitadel organisation
 /// in which its service account and project live, and how long the issued
@@ -17,10 +20,14 @@ pub struct Entitlement {
 	pub instance_roles: Vec<String>,
 	/// Roles on the organisation `org_id`, on top of owning the project.
 	pub org_roles: Vec<String>,
+	/// The verified subject, if the entitlement is per subject: then the
+	/// service account and project names include it, so each issuer and
+	/// subject pair gets its own.
+	pub subject: Option<String>,
 }
 
-/// Resolves a verified issuer origin (scheme + domain + port) and path to
-/// an entitlement.
+/// Resolves a verified issuer origin (scheme + domain + port) and path, plus
+/// the verified token subject (`sub`, if any), to an entitlement.
 ///
 /// Today this is backed by statically configured patterns. In the future,
 /// implementations may query a third-party server for dynamic issuer
@@ -32,6 +39,7 @@ pub trait PermissionResolver: Send + Sync {
 		domain: &str,
 		port: Option<u16>,
 		path: &str,
+		subject: Option<&str>,
 	) -> Option<Entitlement>;
 }
 
@@ -54,16 +62,35 @@ impl PermissionResolver for StaticResolver {
 		domain: &str,
 		port: Option<u16>,
 		path: &str,
+		subject: Option<&str>,
 	) -> Option<Entitlement> {
-		self.grants
-			.iter()
-			.find(|grant| pattern_matches(&grant.pattern, scheme, domain, port, path))
-			.map(|grant| Entitlement {
-				org_id: grant.org_id.clone(),
-				duration: grant.duration.unwrap_or(self.default_duration),
-				instance_roles: grant.instance_roles.clone(),
-				org_roles: grant.org_roles.clone(),
-			})
+		// An empty subject identifies nobody.
+		let subject = subject.filter(|subject| !subject.is_empty());
+		let grant = self.grants.iter().find(|grant| {
+			pattern_matches(&grant.pattern, scheme, domain, port, path)
+				&& match (&grant.subject, subject) {
+					//= docs/requirements/zapp.md#subject-1
+					//# A grant without a subject pattern MUST match
+					//# independently of the token's subject.
+					(None, _) => true,
+					//= docs/requirements/zapp.md#subject-1
+					//# A grant with a subject pattern MUST match a token only
+					//# if the verified subject of the token matches the subject
+					//# pattern.
+					(Some(pattern), Some(subject)) => subject_matches(pattern, subject),
+					//= docs/requirements/zapp.md#subject-1
+					//# A grant with a subject pattern MUST NOT match a token
+					//# without a verified subject or with an empty one.
+					(Some(_), None) => false,
+				}
+		})?;
+		Some(Entitlement {
+			org_id: grant.org_id.clone(),
+			duration: grant.duration.unwrap_or(self.default_duration),
+			instance_roles: grant.instance_roles.clone(),
+			org_roles: grant.org_roles.clone(),
+			subject: grant.subject.as_ref().and(subject).map(str::to_string),
+		})
 	}
 }
 
@@ -106,6 +133,71 @@ pub fn is_valid_path(path: &str) -> bool {
 #[cfg(test)]
 mod tests {
 	use super::*;
+
+	fn grant(pattern: &str, org_id: &str, subject: Option<&str>) -> GrantConfig {
+		GrantConfig {
+			pattern: pattern.to_string(),
+			org_id: org_id.to_string(),
+			duration: None,
+			instance_roles: Vec::new(),
+			org_roles: Vec::new(),
+			subject: subject.map(str::to_string),
+		}
+	}
+
+	fn resolver() -> StaticResolver {
+		StaticResolver::new(
+			vec![
+				grant("https://k8s.example.com", "1", Some("system:serviceaccount:tenant-a:*")),
+				grant("https://k8s.example.com", "2", Some("system:serviceaccount:tenant-b:*")),
+				grant("https://k8s.example.com", "3", None),
+			],
+			Duration::from_secs(3600),
+		)
+	}
+
+	fn resolve(subject: Option<&str>) -> Option<Entitlement> {
+		resolver().resolve("https", "k8s.example.com", None, "", subject)
+	}
+
+	#[test]
+	fn subject_grants_match_only_their_subjects() {
+		//= docs/requirements/zapp.md#subject-1
+		//= type=test
+		//# A grant with a subject pattern MUST match a token only if the
+		//# verified subject of the token matches the subject pattern.
+		let a = resolve(Some("system:serviceaccount:tenant-a:admin-api")).unwrap();
+		assert_eq!(a.org_id, "1");
+		assert_eq!(a.subject.as_deref(), Some("system:serviceaccount:tenant-a:admin-api"));
+		let b = resolve(Some("system:serviceaccount:tenant-b:admin-api")).unwrap();
+		assert_eq!(b.org_id, "2");
+
+		//= docs/requirements/zapp.md#subject-1
+		//= type=test
+		//# A grant without a subject pattern MUST match independently of the
+		//# token's subject.
+		let other = resolve(Some("system:serviceaccount:tenant-c:admin-api")).unwrap();
+		assert_eq!(other.org_id, "3");
+		assert_eq!(other.subject, None, "grants without a subject are per issuer");
+		assert_eq!(resolve(None).unwrap().org_id, "3");
+	}
+
+	#[test]
+	fn subject_grants_need_a_subject() {
+		//= docs/requirements/zapp.md#subject-1
+		//= type=test
+		//# A grant with a subject pattern MUST NOT match a token without a
+		//# verified subject or with an empty one.
+		let only_subject_grants = StaticResolver::new(
+			vec![grant("https://k8s.example.com", "1", Some("**"))],
+			Duration::from_secs(3600),
+		);
+		let resolve =
+			|subject| only_subject_grants.resolve("https", "k8s.example.com", None, "", subject);
+		assert!(resolve(None).is_none());
+		assert!(resolve(Some("")).is_none());
+		assert!(resolve(Some("anything")).is_some());
+	}
 
 	#[test]
 	fn domain_validation() {

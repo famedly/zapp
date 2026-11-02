@@ -94,11 +94,42 @@ impl TokenClaims {
 		format!("{prefix}{}{}", self.host_port(), self.path)
 	}
 
+	/// Names the service account (and project) for this issuer and a
+	/// subject: `<account_name>#<subject>`, the subject percent-encoded
+	/// outside `[a-z0-9:._-]` (so `#` never appears in it), or `None` if the
+	/// name would exceed Zitadel's 200 characters. Neither the prefix nor
+	/// the issuer part can contain `#`, so the name is unambiguous.
+	pub fn subject_account_name(&self, prefix: &str, subject: &str) -> Option<String> {
+		//= docs/requirements/zapp.md#subject-3
+		//# The name for a pair of issuer and subject MUST differ from the name
+		//# for every other issuer and from the name for every other pair of
+		//# issuer and subject.
+		let mut name = format!("{}#", self.account_name(prefix));
+		//= docs/requirements/zapp.md#subject-3
+		//# In names, zapp MUST percent-encode every character of the subject
+		//# other than lower-case letters, digits, colons, dots, underscores and
+		//# hyphens, so that the subjects of any issuer give valid and distinct
+		//# names.
+		for byte in subject.bytes() {
+			match byte {
+				b'a'..=b'z' | b'0'..=b'9' | b':' | b'.' | b'_' | b'-' => name.push(byte as char),
+				_ => name.push_str(&format!("%{byte:02x}")),
+			}
+		}
+		//= docs/requirements/zapp.md#subject-3
+		//# zapp MUST reject a subject if the resulting name would be longer
+		//# than 200 characters.
+		(name.chars().count() <= MAX_NAME_LENGTH).then_some(name)
+	}
+
 	/// URL of the OpenID Connect discovery document for this issuer.
 	fn discovery_url(&self) -> String {
 		format!("{}/.well-known/openid-configuration", self.issuer_url())
 	}
 }
+
+/// Longest service account (user) and project name Zitadel accepts.
+const MAX_NAME_LENGTH: usize = 200;
 
 /// Verifies domain ownership.
 ///
@@ -471,6 +502,10 @@ mod tests {
 
 	#[test]
 	fn names_account_after_issuer() {
+		//= docs/requirements/zapp.md#subject-3
+		//= type=test
+		//# If the matching grant has no subject pattern, the names MUST stay
+		//# the same as without subject support.
 		assert_eq!(
 			named("https://my-app.famedly.dev/k8s/c1", "zapp/"),
 			"zapp/my-app.famedly.dev/k8s/c1"
@@ -490,6 +525,72 @@ mod tests {
 			named("https://app.famedly.dev:8443/k8s", "zapp/"),
 			"zapp/app.famedly.dev:8443/k8s"
 		);
+	}
+
+	#[test]
+	fn names_account_after_issuer_and_subject() {
+		let claims =
+			|iss: &str| parse_claims(&jwt_with_payload(&format!(r#"{{"iss":"{iss}"}}"#))).unwrap();
+		let k8s = claims("https://k8s.example.com");
+		//= docs/requirements/zapp.md#subject-3
+		//= type=test
+		//# If the matching grant has a subject pattern, the names of the
+		//# service account and the project MUST contain the subject, so that
+		//# every pair of issuer and subject gets its own service account and
+		//# project.
+		assert_eq!(
+			k8s.subject_account_name("zapp/", "system:serviceaccount:tenant-a:admin-api")
+				.as_deref(),
+			Some("zapp/k8s.example.com#system:serviceaccount:tenant-a:admin-api")
+		);
+		//= docs/requirements/zapp.md#subject-3
+		//= type=test
+		//# In names, zapp MUST percent-encode every character of the subject
+		//# other than lower-case letters, digits, colons, dots, underscores and
+		//# hyphens, so that the subjects of any issuer give valid and distinct
+		//# names.
+		assert_eq!(
+			k8s.subject_account_name("zapp/", "Auth0|a b@c#%").as_deref(),
+			Some("zapp/k8s.example.com#%41uth0%7ca%20b%40c%23%25")
+		);
+		// Upper-case letters are encoded, so subjects differing in case do
+		// not collide in Zitadel's case-insensitive user names.
+		assert_ne!(k8s.subject_account_name("zapp/", "A"), k8s.subject_account_name("zapp/", "a"));
+		// Non-ASCII subjects are encoded byte by byte.
+		assert_eq!(
+			k8s.subject_account_name("zapp/", "ü").as_deref(),
+			Some("zapp/k8s.example.com#%c3%bc")
+		);
+
+		//= docs/requirements/zapp.md#subject-3
+		//= type=test
+		//# The name for a pair of issuer and subject MUST differ from the name
+		//# for every other issuer and from the name for every other pair of
+		//# issuer and subject.
+		let with_port = claims("https://k8s.example.com:8443");
+		let with_path = claims("https://k8s.example.com/x");
+		let names = [
+			k8s.account_name("zapp/"),
+			with_port.account_name("zapp/"),
+			with_path.account_name("zapp/"),
+			k8s.subject_account_name("zapp/", "8443").unwrap(),
+			k8s.subject_account_name("zapp/", "x").unwrap(),
+			k8s.subject_account_name("zapp/", "/x").unwrap(),
+			with_path.subject_account_name("zapp/", "y").unwrap(),
+			k8s.subject_account_name("zapp/", "x#y").unwrap(),
+			k8s.subject_account_name("zapp/", "x%23y").unwrap(),
+		];
+		let distinct: std::collections::BTreeSet<_> = names.iter().collect();
+		assert_eq!(distinct.len(), names.len(), "{names:?}");
+
+		//= docs/requirements/zapp.md#subject-3
+		//= type=test
+		//# zapp MUST reject a subject if the resulting name would be longer
+		//# than 200 characters.
+		let base = k8s.account_name("zapp/").len() + 1;
+		assert!(k8s.subject_account_name("zapp/", &"a".repeat(200 - base)).is_some());
+		assert!(k8s.subject_account_name("zapp/", &"a".repeat(201 - base)).is_none());
+		assert!(k8s.subject_account_name("zapp/", &"A".repeat(60)).is_none());
 	}
 
 	#[test]

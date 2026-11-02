@@ -8,21 +8,21 @@ SPECIFICATION: [zapp requirements](docs/requirements/zapp.md)
     TEXT[!MUST,implementation,test]: zapp MUST refuse to start if a grant names organisation roles and its issuer pattern contains a wildcard.
 
   SECTION: [SUBJECT-1](#subject-1)
-    TEXT[!MUST]: A grant with a subject pattern MUST match a token only if the verified subject of the token matches the subject pattern.
-    TEXT[!MUST]: A grant with a subject pattern MUST NOT match a token without a verified subject or with an empty one.
-    TEXT[!MUST]: A grant without a subject pattern MUST match independently of the token's subject.
-    TEXT[!MUST]: zapp MUST refuse to start if a subject pattern is empty or contains an invalid wildcard.
+    TEXT[!MUST,implementation,test]: A grant with a subject pattern MUST match a token only if the verified subject of the token matches the subject pattern.
+    TEXT[!MUST,implementation,test]: A grant with a subject pattern MUST NOT match a token without a verified subject or with an empty one.
+    TEXT[!MUST,implementation,test]: A grant without a subject pattern MUST match independently of the token's subject.
+    TEXT[!MUST,implementation,test]: zapp MUST refuse to start if a subject pattern is empty or contains an invalid wildcard.
 
   SECTION: [SUBJECT-2](#subject-2)
     TEXT[!MUST,implementation,test]: When zapp verifies a token by its signature, it MUST take the subject only from the claims of the validated token.
     TEXT[!MUST,implementation,test]: When zapp verifies a token by introspection, it MUST take the subject only from the introspection response and MUST NOT take it from the token payload.
 
   SECTION: [SUBJECT-3](#subject-3)
-    TEXT[!MUST]: If the matching grant has a subject pattern, the names of the service account and the project MUST contain the subject, so that every pair of issuer and subject gets its own service account and project.
-    TEXT[!MUST]: If the matching grant has no subject pattern, the names MUST stay the same as without subject support.
-    TEXT[!MUST]: The name for a pair of issuer and subject MUST differ from the name for every other issuer and from the name for every other pair of issuer and subject.
-    TEXT[!MUST]: In names, zapp MUST percent-encode every character of the subject other than lower-case letters, digits, colons, dots, underscores and hyphens, so that the subjects of any issuer give valid and distinct names.
-    TEXT[!MUST]: zapp MUST reject a subject if the resulting name would be longer than 200 characters.
+    TEXT[!MUST,implementation,test]: If the matching grant has a subject pattern, the names of the service account and the project MUST contain the subject, so that every pair of issuer and subject gets its own service account and project.
+    TEXT[!MUST,implementation,test]: If the matching grant has no subject pattern, the names MUST stay the same as without subject support.
+    TEXT[!MUST,implementation,test]: The name for a pair of issuer and subject MUST differ from the name for every other issuer and from the name for every other pair of issuer and subject.
+    TEXT[!MUST,implementation,test]: In names, zapp MUST percent-encode every character of the subject other than lower-case letters, digits, colons, dots, underscores and hyphens, so that the subjects of any issuer give valid and distinct names.
+    TEXT[!MUST,implementation,test]: zapp MUST reject a subject if the resulting name would be longer than 200 characters.
 
   SECTION: [SUBJECT-4](#subject-4)
-    TEXT[!MUST]: zapp MUST pass the verified subject to the permission resolver.
+    TEXT[!MUST,implementation,test]: zapp MUST pass the verified subject to the permission resolver.

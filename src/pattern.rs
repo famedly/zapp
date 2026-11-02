@@ -51,6 +51,24 @@ pub fn pattern_matches(
 	port_ok && host_matches(host_pattern, domain) && path_matches(path_pattern, path)
 }
 
+/// Matches a token subject against a subject pattern such as
+/// "system:serviceaccount:tenant-a:*". Subjects are compared segment by
+/// segment, split at ':', with the same wildcards as issuer paths: '*' once
+/// per segment (never crossing a ':'), "**" as its own segment for any number
+/// of segments. A subject without ':' is a single segment, so any issuer's
+/// subjects work.
+pub fn subject_matches(pattern: &str, subject: &str) -> bool {
+	let patterns: Vec<&str> = pattern.split(':').collect();
+	let values: Vec<&str> = subject.split(':').collect();
+	segments_match(&patterns, &values)
+}
+
+/// Validates the wildcard structure of a subject pattern, see
+/// [`subject_matches`].
+pub fn validate_subject_pattern(pattern: &str) -> Result<(), String> {
+	validate_wildcard_segments(pattern.split(':'), "subject segment", "subject")
+}
+
 fn host_matches(pattern: &str, domain: &str) -> bool {
 	let pattern = pattern.to_ascii_lowercase();
 	let domain = domain.to_ascii_lowercase();
@@ -285,6 +303,38 @@ mod tests {
 		assert!(pattern_matches(any, "http", "localhost", Some(39231), ""));
 		assert!(pattern_matches(any, "http", "localhost", None, "/k8s"));
 		assert!(!pattern_matches(any, "http", "remotehost", Some(39231), ""));
+	}
+
+	#[test]
+	fn subject_patterns() {
+		let tenant = "system:serviceaccount:tenant-a:*";
+		assert!(subject_matches(tenant, "system:serviceaccount:tenant-a:admin-api"));
+		assert!(!subject_matches(tenant, "system:serviceaccount:tenant-b:admin-api"));
+		assert!(!subject_matches(tenant, "system:serviceaccount:tenant-a"));
+
+		let service = "system:serviceaccount:tenant-*:admin-api";
+		assert!(subject_matches(service, "system:serviceaccount:tenant-a:admin-api"));
+		assert!(!subject_matches(service, "system:serviceaccount:tenant-a:other"));
+		// '*' never crosses a ':'.
+		assert!(!subject_matches(service, "system:serviceaccount:tenant-a:x:admin-api"));
+
+		assert!(subject_matches("system:**", "system:serviceaccount:a:b"));
+		// Subjects of other issuers are a single segment.
+		assert!(subject_matches("312909075212345678", "312909075212345678"));
+		assert!(subject_matches("auth0|*", "auth0|abc"));
+		assert!(!subject_matches("auth0|*", "google|abc"));
+		assert!(!subject_matches("exact", "exact:more"));
+	}
+
+	#[test]
+	fn subject_pattern_validation() {
+		assert!(validate_subject_pattern("system:serviceaccount:tenant-a:*").is_ok());
+		assert!(validate_subject_pattern("system:**").is_ok());
+		assert!(validate_subject_pattern("").is_err());
+		assert!(validate_subject_pattern("a::b").is_err());
+		assert!(validate_subject_pattern("a**b").is_err());
+		assert!(validate_subject_pattern("**:a:**").is_err());
+		assert!(validate_subject_pattern("*a*").is_err());
 	}
 
 	#[test]

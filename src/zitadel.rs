@@ -864,7 +864,7 @@ impl ZitadelClient {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
 	use aws_lc_rs::{
 		encoding::{AsDer, Pkcs8V1Der},
 		rsa::{KeyPair, KeySize},
@@ -881,7 +881,7 @@ mod tests {
 
 	/// A client talking to `server`, authenticated with a freshly generated
 	/// service user key against a mocked token endpoint.
-	async fn test_client(server: &MockServer) -> ZitadelClient {
+	pub(crate) async fn test_client(server: &MockServer) -> ZitadelClient {
 		Mock::given(method("POST"))
 			.and(path("/oauth/v2/token"))
 			.respond_with(ResponseTemplate::new(200).set_body_json(json!({
