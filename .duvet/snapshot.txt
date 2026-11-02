@@ -36,8 +36,8 @@ SPECIFICATION: [zapp requirements](docs/requirements/zapp.md)
     TEXT[!MUST,implementation,test]: zapp MUST NOT use the recorded subject to recognise, adopt or garbage collect service accounts.
 
   SECTION: [HOME-ORG-1](#home-org-1)
-    TEXT[!MUST]: If no home organisation is configured, zapp MUST create the service account and the project in the grant's organisation.
-    TEXT[!MUST]: If a home organisation is configured, zapp MUST create the service account and the project in the home organisation instead of the grant's organisation.
-    TEXT[!MUST]: If a home organisation is configured, zapp MUST give the service account its organisation roles on the grant's organisation.
-    TEXT[!MUST]: If a home organisation is configured, garbage collection MUST include the home organisation.
-    TEXT[!MUST]: zapp MUST refuse to start if the home organisation ID is not numeric.
+    TEXT[!MUST,implementation,test]: If no home organisation is configured, zapp MUST create the service account and the project in the grant's organisation.
+    TEXT[!MUST,implementation,test]: If a home organisation is configured, zapp MUST create the service account and the project in the home organisation instead of the grant's organisation.
+    TEXT[!MUST,implementation,test]: If a home organisation is configured, zapp MUST give the service account its organisation roles on the grant's organisation.
+    TEXT[!MUST,implementation,test]: If a home organisation is configured, garbage collection MUST include the home organisation.
+    TEXT[!MUST,implementation,test]: zapp MUST refuse to start if the home organisation ID is not numeric.

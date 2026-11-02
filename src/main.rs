@@ -39,7 +39,7 @@ async fn main() -> anyhow::Result<()> {
 	let zitadel = Arc::new(ZitadelClient::new(&config.zitadel).await?);
 
 	if let Some(gc) = config.gc.clone() {
-		let org_ids = config.grants.iter().map(|grant| grant.org_id.clone()).collect();
+		let org_ids = config.gc_org_ids();
 		info!(
 			"garbage collection every {}: deactivate after {}, delete after {}",
 			humantime::format_duration(gc.interval),

@@ -188,6 +188,8 @@ pub struct ZitadelClient {
 	token: Arc<Token>,
 	http: ClientWithMiddleware,
 	url: Url,
+	/// Home organisation of all service accounts and projects, if configured.
+	account_org_id: Option<String>,
 }
 
 impl ZitadelClient {
@@ -204,7 +206,13 @@ impl ZitadelClient {
 		let token = Token::new(config.url.clone(), &config.key_file, http.clone(), None, None)
 			.await
 			.with_context(|| format!("authenticating against Zitadel at {}", config.url))?;
-		Ok(Self { zitadel, token: Arc::new(token), http, url: config.url.clone() })
+		Ok(Self {
+			zitadel,
+			token: Arc::new(token),
+			http,
+			url: config.url.clone(),
+			account_org_id: config.account_org_id.clone(),
+		})
 	}
 
 	/// Base URL of the Zitadel instance the credentials are valid for.
@@ -212,11 +220,13 @@ impl ZitadelClient {
 		&self.url
 	}
 
-	/// Ensures that in the entitlement's organisation `org_id` an active
+	/// Ensures that in the home organisation (or else the entitlement's
+	/// organisation `org_id`) an active
 	/// project `name` and an active service account `name` exist, that the
 	/// service account records itself as creator of the project (metadata),
 	/// owns it and holds exactly `instance_roles` on the instance and
-	/// `org_roles` on organisation `org_id` (each if any), and issues a
+	/// `org_roles` on the entitlement's organisation (each if any), and
+	/// issues a
 	/// credential of the requested kind valid for `duration`.
 	///
 	/// Both are created optimistically and adopted (reactivated if needed)
@@ -231,8 +241,19 @@ impl ZitadelClient {
 		entitlement: &Entitlement,
 		credential_type: CredentialType,
 	) -> anyhow::Result<Provisioned> {
-		let Entitlement { org_id, duration, instance_roles, org_roles, subject } = entitlement;
-		let org_id = org_id.as_str();
+		let Entitlement { org_id: grant_org_id, duration, instance_roles, org_roles, subject } =
+			entitlement;
+		let org_id = match &self.account_org_id {
+			//= docs/requirements/zapp.md#home-org-1
+			//# If a home organisation is configured, zapp MUST create the
+			//# service account and the project in the home organisation instead
+			//# of the grant's organisation.
+			Some(home) => home.as_str(),
+			//= docs/requirements/zapp.md#home-org-1
+			//# If no home organisation is configured, zapp MUST create the
+			//# service account and the project in the grant's organisation.
+			None => grant_org_id.as_str(),
+		};
 		let project_id = self.ensure_project(name, org_id).await?;
 		let user_id = self
 			.ensure_service_account(name, issuer, subject.as_deref(), org_id, &project_id)
@@ -247,7 +268,10 @@ impl ZitadelClient {
 		// shortcut: like instance_roles, removed org_roles stay until GC
 		// deletes the account.
 		if !org_roles.is_empty() {
-			self.ensure_org_member(org_id, &user_id, org_roles).await?;
+			//= docs/requirements/zapp.md#home-org-1
+			//# If a home organisation is configured, zapp MUST give the service
+			//# account its organisation roles on the grant's organisation.
+			self.ensure_org_member(grant_org_id, &user_id, org_roles).await?;
 		}
 
 		let expires_at = (OffsetDateTime::now_utc() + *duration)
@@ -897,6 +921,10 @@ pub(crate) mod tests {
 	/// A client talking to `server`, authenticated with a freshly generated
 	/// service user key against a mocked token endpoint.
 	pub(crate) async fn test_client(server: &MockServer) -> ZitadelClient {
+		test_client_with_home(server, None).await
+	}
+
+	async fn test_client_with_home(server: &MockServer, home: Option<&str>) -> ZitadelClient {
 		Mock::given(method("POST"))
 			.and(path("/oauth/v2/token"))
 			.respond_with(ResponseTemplate::new(200).set_body_json(json!({
@@ -927,6 +955,7 @@ pub(crate) mod tests {
 			account_prefix_https: "zapp/".to_string(),
 			account_prefix_http: None,
 			default_duration: Duration::from_secs(3600),
+			account_org_id: home.map(str::to_string),
 		};
 		let client = ZitadelClient::new(&config).await.expect("connecting to mock Zitadel");
 		std::fs::remove_file(key_file).ok();
@@ -1056,6 +1085,79 @@ pub(crate) mod tests {
 		let ids: Vec<_> = accounts.iter().map(|account| account.user_id.as_str()).collect();
 		assert_eq!(ids, ["2"]);
 		assert_eq!(accounts[0].project_ids, ["10"]);
+	}
+
+	/// Provisions with org roles against a Zitadel that expects the account
+	/// and project in `account_org` and the org membership in `ORG_ID`.
+	async fn provision_in(home: Option<&str>, account_org: &str) {
+		let server = MockServer::start().await;
+		let client = test_client_with_home(&server, home).await;
+		let ok = |body: serde_json::Value| ResponseTemplate::new(200).set_body_json(body);
+		for (route, body) in [
+			("/management/v1/projects", json!({ "id": "10" })),
+			("/management/v1/users/machine", json!({ "userId": USER_ID })),
+			(&format!("/management/v1/users/{USER_ID}/metadata/_bulk"), json!({})),
+			("/management/v1/projects/10/members", json!({})),
+			(&format!("/management/v1/users/{USER_ID}/pats"), json!({ "token": "pat" })),
+		] {
+			Mock::given(method("POST"))
+				.and(path(route))
+				.and(header(HEADER_ZITADEL_ORGANIZATION_ID, account_org))
+				.respond_with(ok(body))
+				.expect(1)
+				.mount(&server)
+				.await;
+		}
+		Mock::given(method("POST"))
+			.and(path("/management/v1/orgs/me/members"))
+			.and(header(HEADER_ZITADEL_ORGANIZATION_ID, ORG_ID))
+			.and(body_json(json!({ "userId": USER_ID, "roles": ["ORG_USER_MANAGER"] })))
+			.respond_with(ok(json!({})))
+			.expect(1)
+			.mount(&server)
+			.await;
+
+		let entitlement = Entitlement {
+			org_id: ORG_ID.to_string(),
+			duration: Duration::from_secs(3600),
+			instance_roles: Vec::new(),
+			org_roles: roles(),
+			subject: None,
+		};
+		let provisioned = client
+			.provision(
+				"zapp/k8s.example.com",
+				"https://k8s.example.com",
+				&entitlement,
+				CredentialType::Pat,
+			)
+			.await
+			.expect("provisioned");
+		assert_eq!(provisioned.project_id, "10");
+	}
+
+	#[tokio::test]
+	async fn provisions_in_the_grant_org_by_default() {
+		//= docs/requirements/zapp.md#home-org-1
+		//= type=test
+		//# If no home organisation is configured, zapp MUST create the service
+		//# account and the project in the grant's organisation.
+		provision_in(None, ORG_ID).await;
+	}
+
+	#[tokio::test]
+	async fn provisions_in_the_home_org() {
+		//= docs/requirements/zapp.md#home-org-1
+		//= type=test
+		//# If a home organisation is configured, zapp MUST create the service
+		//# account and the project in the home organisation instead of the
+		//# grant's organisation.
+
+		//= docs/requirements/zapp.md#home-org-1
+		//= type=test
+		//# If a home organisation is configured, zapp MUST give the service
+		//# account its organisation roles on the grant's organisation.
+		provision_in(Some("999"), "999").await;
 	}
 
 	#[tokio::test]

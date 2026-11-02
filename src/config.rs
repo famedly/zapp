@@ -50,6 +50,14 @@ pub struct ZitadelConfig {
 	/// account, e.g. "24h" or "30m".
 	#[serde(default = "default_duration", with = "humantime_serde")]
 	pub default_duration: Duration,
+	/// ID of a home organisation in which all service accounts and projects
+	/// are created, whatever the grant's `org_id`; `org_roles` are then
+	/// granted on the grant's organisation to a member from this one. Keeps
+	/// zapp's metadata out of reach of accounts that may write the users of
+	/// the organisations they act on. Unset: accounts live in the grant's
+	/// organisation.
+	#[serde(default)]
+	pub account_org_id: Option<String>,
 }
 
 /// How self-issued tokens are verified. zapp always fetches
@@ -159,6 +167,16 @@ impl Config {
 		if !self.zitadel.url.path().ends_with('/') {
 			let path = format!("{}/", self.zitadel.url.path());
 			self.zitadel.url.set_path(&path);
+		}
+		if let Some(org_id) = &self.zitadel.account_org_id
+			&& (org_id.is_empty() || !org_id.chars().all(|c| c.is_ascii_digit()))
+		{
+			//= docs/requirements/zapp.md#home-org-1
+			//# zapp MUST refuse to start if the home organisation ID is not
+			//# numeric.
+			anyhow::bail!(
+				"zitadel.account_org_id {org_id:?} is invalid: Zitadel organisation IDs are numeric"
+			);
 		}
 		if self.zitadel.default_duration.is_zero() {
 			anyhow::bail!("zitadel.default_duration must be positive");
@@ -280,6 +298,21 @@ impl Config {
 			}
 		}
 		Ok(self)
+	}
+}
+
+impl Config {
+	/// Organisations garbage collection scans: every grant's, plus the home
+	/// organisation if configured.
+	pub fn gc_org_ids(&self) -> std::collections::BTreeSet<String> {
+		//= docs/requirements/zapp.md#home-org-1
+		//# If a home organisation is configured, garbage collection MUST
+		//# include the home organisation.
+		self.grants
+			.iter()
+			.map(|grant| grant.org_id.clone())
+			.chain(self.zitadel.account_org_id.clone())
+			.collect()
 	}
 }
 
@@ -491,6 +524,38 @@ org_id = "123456789012345678"
 			let toml = MINIMAL.to_string() + &format!("subject = \"{subject}\"\n");
 			assert!(parse(&toml).is_err(), "subject {subject:?} should be rejected");
 		}
+	}
+
+	#[test]
+	fn home_organisation() {
+		let with_home = |org_id: &str| {
+			parse(&MINIMAL.replace(
+				"key_file = \"/run/secrets/zapp-key.json\"",
+				&format!(
+					"key_file = \"/run/secrets/zapp-key.json\"\naccount_org_id = \"{org_id}\""
+				),
+			))
+		};
+		let config = with_home("999").expect("valid config");
+		assert_eq!(config.zitadel.account_org_id.as_deref(), Some("999"));
+		//= docs/requirements/zapp.md#home-org-1
+		//= type=test
+		//# If a home organisation is configured, garbage collection MUST
+		//# include the home organisation.
+		assert_eq!(
+			config.gc_org_ids().into_iter().collect::<Vec<_>>(),
+			["123456789012345678", "999"]
+		);
+		let without = parse(MINIMAL).expect("valid config");
+		assert_eq!(without.zitadel.account_org_id, None);
+		assert_eq!(without.gc_org_ids().into_iter().collect::<Vec<_>>(), ["123456789012345678"]);
+
+		//= docs/requirements/zapp.md#home-org-1
+		//= type=test
+		//# zapp MUST refuse to start if the home organisation ID is not
+		//# numeric.
+		assert!(with_home("").is_err());
+		assert!(with_home("home").is_err());
 	}
 
 	#[test]
