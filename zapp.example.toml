@@ -28,6 +28,13 @@ account_prefix_http = "zapp-insecure/"
 # Personal access token lifetime (humantime syntax, e.g. "30m", "12h",
 # "7days"), used when a grant does not set its own duration.
 default_duration = "24h"
+# Optional home organisation: when set, every service account and project
+# is created in this organisation, and org_roles are granted on the grant's
+# org_id to a member from here. Recommended with org_roles that can write
+# users (e.g. ORG_USER_MANAGER): such an account can then not touch zapp's
+# metadata, which lives in the home organisation. Unset: accounts and
+# projects live in the grant's org_id.
+# account_org_id = "999999999999999999"
 
 # zapp always fetches {issuer}/.well-known/openid-configuration from the
 # token's issuer. If the metadata advertises an introspection_endpoint,

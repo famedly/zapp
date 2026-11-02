@@ -28,12 +28,12 @@ configurable ruleset; each rule names the Zitadel organisation it entitles to.
 Keep production patterns on `https://` (an http ownership proof can be spoofed
 on the network) and reserve `http://` for local testing.
 
-In exchange, zapp creates in that organisation a **service account** named after
-the issuer (and subject, for subject-scoped grants), a **project** of the same
-name, makes the service account **project owner**, and returns a credential for
-it: a personal access token or, on request, a machine key. With that the client
-can manage its project (applications, roles, grants, ...) through the Zitadel
-API on its own.
+In exchange, zapp creates in that organisation (or in a configured home
+organisation) a **service account** named after the issuer (and subject, for
+subject-scoped grants), a **project** of the same name, makes the service
+account **project owner**, and returns a credential for it: a personal access
+token or, on request, a machine key. With that the client can manage its project
+(applications, roles, grants, ...) through the Zitadel API on its own.
 
 ```
 client                         zapp                        client's issuer       Zitadel
@@ -67,8 +67,9 @@ zapp authenticates against Zitadel as a service user with a private key JSON
 file (`zitadel.key_file`). That service user must be able to manage users,
 projects and project members in every organisation named by a grant:
 `IAM_OWNER`, or `ORG_OWNER` on each of those organisations (which also covers
-granting `org_roles`). If any grant sets `instance_roles`, it needs `IAM_OWNER`.
-See [`zapp.example.toml`](zapp.example.toml) for all options.
+granting `org_roles`), and in the home organisation `zitadel.account_org_id` if
+set. If any grant sets `instance_roles`, it needs `IAM_OWNER`. See
+[`zapp.example.toml`](zapp.example.toml) for all options.
 
 ## API
 
@@ -132,12 +133,14 @@ Every step is optimistic and converges under concurrent requests:
 1. **Create the project** named after the issuer. On `409 Conflict` the existing
    project of that name is looked up and reactivated if needed.
 1. **Create the service account** of the same name and set metadata on it:
-   `origin = <issuer>` marks it as zapp-managed, `creator.<project id> = 1`
-   records the project it was provisioned for (the ID is in the key, so several
-   can coexist). On `409 Conflict` the existing account is adopted: the metadata
-   is added, it is reactivated or unlocked, and any _other_ project recorded in
-   its `creator.*` keys is deleted, so an account owns exactly one project. zapp
-   refuses to adopt a human user of that name.
+   `origin = <issuer>` marks it as zapp-managed, `subject = <subject>` (only for
+   subject-scoped grants, for auditing; zapp never acts on it),
+   `creator.<project id> = 1` records the project it was provisioned for (the ID
+   is in the key, so several can coexist). On `409 Conflict` the existing
+   account is adopted: the metadata is added, it is reactivated or unlocked, and
+   any _other_ project recorded in its `creator.*` keys is deleted, so an
+   account owns exactly one project. zapp refuses to adopt a human user of that
+   name.
 1. **Make it `PROJECT_OWNER`**. On `409 Conflict` (already a member) the role is
    restored if the account had dropped it.
 1. **Grant instance roles**, only if the grant sets `instance_roles`: the
@@ -175,8 +178,18 @@ This no longer holds for an account whose `org_roles` include writing users
 (`ORG_USER_MANAGER`, `ORG_OWNER`): it can write the metadata of every user in
 its organisation, its own included, and thereby make zapp remove any project of
 that organisation (by recording it as `creator.*`) or adopt other accounts into
-garbage collection. Only grant such roles in an organisation whose users and
-projects all belong to the party the account acts for (e.g. one tenant).
+garbage collection. Two ways out:
+
+- Set `zitadel.account_org_id` to a **home organisation**: every service account
+  and project is then created there, and `org_roles` are granted on the grant's
+  organisation to a member from the home organisation (Zitadel accepts org
+  members from other organisations). An account can write the users of the
+  organisation it acts on, but not those of the home organisation, so zapp's
+  metadata stays out of its reach. Do not give any account user-writing roles on
+  the home organisation itself.
+- Without a home organisation, only grant such roles in an organisation whose
+  users and projects all belong to the party the account acts for (e.g. one
+  tenant).
 
 ### Garbage collection
 
@@ -237,6 +250,15 @@ The subject is split at `:` and matched segment by segment like an issuer path:
 number of segments; e.g. `system:serviceaccount:tenant-*:admin-api`. Subjects
 without `:` (other issuers use numeric IDs, UUIDs, `provider|id`, ...) are a
 single segment, so this works for any issuer, not only Kubernetes.
+
+When zapp runs inside a Kubernetes cluster and the issuer is the API server
+itself (e.g. `https://kubernetes.default.svc`), set `verification.ca_file` to
+the cluster CA (`/var/run/secrets/kubernetes.io/serviceaccount/ca.crt`): its
+certificates are trusted for discovery, introspection and JWKS requests on top
+of the system roots. zapp fetches discovery and JWKS without credentials, so the
+API server must allow anonymous requests to them, e.g. by binding the
+`system:service-account-issuer-discovery` ClusterRole to
+`system:unauthenticated` (by default it is bound to service accounts only).
 
 Only a verified subject is used: from the claims of a token whose signature was
 validated against the JWKS, or from the `sub` of the introspection response —
