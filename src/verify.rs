@@ -64,6 +64,10 @@ pub struct TokenClaims {
 	/// `policy::is_valid_path`).
 	pub path: String,
 	pub audiences: Vec<String>,
+	/// The token's subject (`sub`), set only once the token has been
+	/// verified: from the validated JWT claims, or from the introspection
+	/// response. Never taken from the unverified payload.
+	pub subject: Option<String>,
 }
 
 impl TokenClaims {
@@ -142,7 +146,7 @@ impl DomainVerifier {
 
 	/// Verifies the token and returns the proven issuer claims.
 	pub async fn verify(&self, token: &str) -> Result<TokenClaims, VerifyError> {
-		let issuer = parse_claims(token)?;
+		let mut issuer = parse_claims(token)?;
 
 		if issuer.scheme == "http" && !self.allow_http {
 			return Err(VerifyError::HttpIssuerDisallowed(issuer.raw));
@@ -163,13 +167,13 @@ impl DomainVerifier {
 			reason: e.to_string(),
 		})?;
 
-		if let Some(endpoint) = metadata.introspection_endpoint {
-			self.introspect(&issuer, &endpoint, token).await?;
+		issuer.subject = if let Some(endpoint) = metadata.introspection_endpoint {
+			self.introspect(&issuer, &endpoint, token).await?
 		} else if let Some(jwks_uri) = metadata.jwks_uri {
-			self.verify_jwks(&issuer, metadata.issuer.as_deref(), &jwks_uri, token).await?;
+			self.verify_jwks(&issuer, metadata.issuer.as_deref(), &jwks_uri, token).await?
 		} else {
 			return Err(VerifyError::NoDiscoveredMethod(issuer.domain));
-		}
+		};
 		Ok(issuer)
 	}
 
@@ -184,7 +188,7 @@ impl DomainVerifier {
 		issuer: &TokenClaims,
 		endpoint: &str,
 		token: &str,
-	) -> Result<(), VerifyError> {
+	) -> Result<Option<String>, VerifyError> {
 		let domain = issuer.domain.as_str();
 		// Not strictly required for the core proof: the discovery document
 		// itself was fetched from the claimed origin, so the origin
@@ -207,6 +211,7 @@ impl DomainVerifier {
 		#[derive(Deserialize)]
 		struct IntrospectionResponse {
 			active: bool,
+			sub: Option<String>,
 		}
 
 		let response = self
@@ -232,7 +237,11 @@ impl DomainVerifier {
 		if !body.active {
 			return Err(VerifyError::TokenInactive(domain.to_string()));
 		}
-		Ok(())
+		//= docs/requirements/zapp.md#subject-2
+		//# When zapp verifies a token by introspection, it MUST take the
+		//# subject only from the introspection response and MUST NOT take it
+		//# from the token payload.
+		Ok(body.sub)
 	}
 
 	async fn verify_jwks(
@@ -241,7 +250,7 @@ impl DomainVerifier {
 		metadata_issuer: Option<&str>,
 		jwks_uri: &str,
 		token: &str,
-	) -> Result<(), VerifyError> {
+	) -> Result<Option<String>, VerifyError> {
 		// The discovery document must name the issuer we asked for; this
 		// binds the key set to the token's iss claim.
 		let found = metadata_issuer.unwrap_or_default();
@@ -287,13 +296,14 @@ impl DomainVerifier {
 }
 
 /// Validates signature, expiry, audience and issuer of a token against a
-/// JWK set. Pure so it can be tested without network access.
+/// JWK set and returns its subject (`sub`), if any. Pure so it can be tested
+/// without network access.
 fn validate_with_jwks(
 	jwks: &JwkSet,
 	token: &str,
 	audience: &str,
 	issuer: &str,
-) -> Result<(), VerifyError> {
+) -> Result<Option<String>, VerifyError> {
 	let header = jsonwebtoken::decode_header(token)
 		.map_err(|e| VerifyError::MalformedToken(e.to_string()))?;
 
@@ -319,9 +329,16 @@ fn validate_with_jwks(
 	validation.set_issuer(&[issuer]);
 	validation.set_required_spec_claims(&["exp", "aud", "iss"]);
 
-	jsonwebtoken::decode::<serde_json::Value>(token, &key, &validation)
+	#[derive(Deserialize)]
+	struct Validated {
+		sub: Option<String>,
+	}
+	let validated = jsonwebtoken::decode::<Validated>(token, &key, &validation)
 		.map_err(|e| VerifyError::Jwt(e.to_string()))?;
-	Ok(())
+	//= docs/requirements/zapp.md#subject-2
+	//# When zapp verifies a token by its signature, it MUST take the subject
+	//# only from the claims of the validated token.
+	Ok(validated.claims.sub)
 }
 
 /// Extracts issuer and audiences from an (unverified) JWT payload. The
@@ -387,7 +404,16 @@ pub fn parse_claims(token: &str) -> Result<TokenClaims, VerifyError> {
 	if !is_valid_domain(&domain) {
 		return Err(VerifyError::InvalidIssuerDomain(issuer.to_string()));
 	}
-	Ok(TokenClaims { raw: issuer.to_string(), scheme, domain, port, path, audiences })
+	// The subject is only filled in after verification.
+	Ok(TokenClaims {
+		raw: issuer.to_string(),
+		scheme,
+		domain,
+		port,
+		path,
+		audiences,
+		subject: None,
+	})
 }
 
 #[cfg(test)]
@@ -585,7 +611,64 @@ mod tests {
 				"exp": now() + 300,
 			}),
 		);
-		validate_with_jwks(&jwks, &token, AUDIENCE, ISSUER).expect("valid token");
+		//= docs/requirements/zapp.md#subject-2
+		//= type=test
+		//# When zapp verifies a token by its signature, it MUST take the
+		//# subject only from the claims of the validated token.
+		assert_eq!(
+			validate_with_jwks(&jwks, &token, AUDIENCE, ISSUER).expect("valid token").as_deref(),
+			Some("system:serviceaccount:default:zapp-client")
+		);
+	}
+
+	#[tokio::test]
+	async fn introspection_subject_comes_from_the_response() {
+		use wiremock::{
+			Mock, MockServer, ResponseTemplate,
+			matchers::{method, path},
+		};
+
+		let server = MockServer::start().await;
+		let iss = server.uri();
+		Mock::given(method("GET"))
+			.and(path("/.well-known/openid-configuration"))
+			.respond_with(ResponseTemplate::new(200).set_body_json(json!({
+				"issuer": iss,
+				"introspection_endpoint": format!("{iss}/introspect"),
+			})))
+			.mount(&server)
+			.await;
+		let introspected = |body: serde_json::Value| {
+			Mock::given(method("POST"))
+				.and(path("/introspect"))
+				.respond_with(ResponseTemplate::new(200).set_body_json(body))
+		};
+		// The unverified payload names a different subject than the
+		// introspection endpoint.
+		let token = jwt_with_payload(
+			&json!({ "iss": iss, "aud": AUDIENCE, "sub": "from-payload" }).to_string(),
+		);
+		let verifier = DomainVerifier::new(
+			&VerificationConfig { audience: AUDIENCE.to_string(), timeout_secs: 5 },
+			true,
+		)
+		.unwrap();
+
+		//= docs/requirements/zapp.md#subject-2
+		//= type=test
+		//# When zapp verifies a token by introspection, it MUST take the
+		//# subject only from the introspection response and MUST NOT take it
+		//# from the token payload.
+		let mock = introspected(json!({ "active": true, "sub": "from-introspection" }))
+			.mount_as_scoped(&server)
+			.await;
+		let claims = verifier.verify(&token).await.expect("active token");
+		assert_eq!(claims.subject.as_deref(), Some("from-introspection"));
+		drop(mock);
+
+		introspected(json!({ "active": true })).mount(&server).await;
+		let claims = verifier.verify(&token).await.expect("active token");
+		assert_eq!(claims.subject, None, "the unverified payload must not be used");
 	}
 
 	#[test]

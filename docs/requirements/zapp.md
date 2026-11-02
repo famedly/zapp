@@ -40,7 +40,7 @@ A grant can name a subject pattern.
 
 A grant with a subject pattern MUST match a token only if the verified subject of the token matches the subject pattern.
 
-A grant with a subject pattern MUST NOT match a token without a verified subject.
+A grant with a subject pattern MUST NOT match a token without a verified subject or with an empty one.
 
 A grant without a subject pattern MUST match independently of the token's subject.
 
@@ -60,7 +60,9 @@ If the matching grant has no subject pattern, the names MUST stay the same as wi
 
 The name for a pair of issuer and subject MUST differ from the name for every other issuer and from the name for every other pair of issuer and subject.
 
-zapp MUST reject a subject for a name if it contains characters other than lower-case letters, digits, colons, dots, underscores and hyphens, or if the resulting name would be longer than 200 characters.
+In names, zapp MUST percent-encode every character of the subject other than lower-case letters, digits, colons, dots, underscores and hyphens, so that the subjects of any issuer give valid and distinct names.
+
+zapp MUST reject a subject if the resulting name would be longer than 200 characters.
 
 ### SUBJECT-4
 
