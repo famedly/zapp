@@ -41,6 +41,10 @@ default_duration = "24h"
 audience = "zapp"
 # Timeout in seconds for discovery, introspection and JWKS requests.
 timeout_secs = 10
+# Optional PEM bundle of extra CA certificates trusted for these requests
+# (on top of the system roots), e.g. the cluster CA when zapp runs inside a
+# Kubernetes cluster whose issuer is the API server itself.
+# ca_file = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
 
 # Garbage collection of service accounts whose issuer stopped renewing.
 # Optional: omit the section to disable. An account's age is the time since

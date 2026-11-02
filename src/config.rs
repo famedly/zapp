@@ -65,11 +65,17 @@ pub struct VerificationConfig {
 	/// introspection and JWKS fetches).
 	#[serde(default = "default_timeout_secs")]
 	pub timeout_secs: u64,
+	/// PEM bundle of additional CA certificates to trust for these requests,
+	/// on top of the system roots, e.g. the cluster CA
+	/// (`/var/run/secrets/kubernetes.io/serviceaccount/ca.crt`) when the
+	/// issuer is the Kubernetes API server.
+	#[serde(default)]
+	pub ca_file: Option<PathBuf>,
 }
 
 impl Default for VerificationConfig {
 	fn default() -> Self {
-		Self { audience: default_audience(), timeout_secs: default_timeout_secs() }
+		Self { audience: default_audience(), timeout_secs: default_timeout_secs(), ca_file: None }
 	}
 }
 

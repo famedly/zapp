@@ -4,6 +4,7 @@
 
 use std::time::Duration;
 
+use anyhow::Context as _;
 use jsonwebtoken::{AlgorithmFamily, DecodingKey, Validation, jwk::JwkSet};
 use serde::Deserialize;
 
@@ -168,10 +169,29 @@ struct DiscoveryMetadata {
 
 impl DomainVerifier {
 	pub fn new(config: &VerificationConfig, allow_http: bool) -> anyhow::Result<Self> {
-		let http = reqwest::Client::builder()
+		let mut builder = reqwest::Client::builder()
 			.timeout(Duration::from_secs(config.timeout_secs))
-			.redirect(reqwest::redirect::Policy::none())
-			.build()?;
+			.redirect(reqwest::redirect::Policy::none());
+		if let Some(ca_file) = &config.ca_file {
+			//= docs/requirements/zapp.md#ca-1
+			//# zapp MUST refuse to start if the configured CA bundle cannot be
+			//# read or contains no certificate.
+			let pem = std::fs::read(ca_file)
+				.with_context(|| format!("reading verification.ca_file {}", ca_file.display()))?;
+			let certs = reqwest::Certificate::from_pem_bundle(&pem)
+				.with_context(|| format!("parsing verification.ca_file {}", ca_file.display()))?;
+			anyhow::ensure!(
+				!certs.is_empty(),
+				"verification.ca_file {} contains no certificate",
+				ca_file.display()
+			);
+			//= docs/requirements/zapp.md#ca-1
+			//# If a CA bundle is configured, zapp MUST trust its certificates
+			//# for discovery, introspection and JWKS requests, in addition to
+			//# the system's trusted roots.
+			builder = builder.tls_certs_merge(certs);
+		}
+		let http = builder.build()?;
 		Ok(Self { http, audience: config.audience.clone(), allow_http })
 	}
 
@@ -462,6 +482,137 @@ mod tests {
 		format!("{header}.{body}.signature")
 	}
 
+	/// Serves `{iss}/.well-known/openid-configuration` and an introspection
+	/// endpoint over TLS on `localhost`, with a certificate issued by a
+	/// freshly generated CA. Returns the issuer URL and the CA certificate
+	/// (PEM).
+	async fn tls_issuer() -> (String, String) {
+		use rcgen::{BasicConstraints, CertificateParams, CertifiedIssuer, IsCa, KeyPair};
+		use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+		use tokio_rustls::{
+			TlsAcceptor,
+			rustls::{
+				ServerConfig,
+				pki_types::{PrivateKeyDer, PrivatePkcs8KeyDer},
+			},
+		};
+
+		let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+		ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+		let ca = CertifiedIssuer::self_signed(ca_params, KeyPair::generate().unwrap()).unwrap();
+		let server_key = KeyPair::generate().unwrap();
+		let server_cert = CertificateParams::new(vec!["localhost".to_string()])
+			.unwrap()
+			.signed_by(&server_key, &ca)
+			.unwrap();
+		let config = ServerConfig::builder()
+			.with_no_client_auth()
+			.with_single_cert(
+				vec![server_cert.der().clone()],
+				PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(server_key.serialize_der())),
+			)
+			.unwrap();
+		let acceptor = TlsAcceptor::from(std::sync::Arc::new(config));
+
+		let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+		let iss = format!("https://localhost:{}", listener.local_addr().unwrap().port());
+		let discovery =
+			json!({ "issuer": iss, "introspection_endpoint": format!("{iss}/introspect") })
+				.to_string();
+		tokio::spawn(async move {
+			while let Ok((tcp, _)) = listener.accept().await {
+				let (acceptor, discovery) = (acceptor.clone(), discovery.clone());
+				tokio::spawn(async move {
+					let Ok(mut tls) = acceptor.accept(tcp).await else { return };
+					// Read the head and the body announced in it, then answer
+					// by request line and close.
+					let mut request = Vec::new();
+					let mut buf = [0u8; 4096];
+					loop {
+						let n = tls.read(&mut buf).await.unwrap_or(0);
+						if n == 0 {
+							return;
+						}
+						request.extend_from_slice(&buf[..n]);
+						let text = String::from_utf8_lossy(&request).to_ascii_lowercase();
+						if let Some(end) = text.find("\r\n\r\n") {
+							let length = text
+								.lines()
+								.find_map(|line| line.strip_prefix("content-length:"))
+								.and_then(|value| value.trim().parse::<usize>().ok())
+								.unwrap_or(0);
+							if request.len() >= end + 4 + length {
+								break;
+							}
+						}
+					}
+					let body = if request.starts_with(b"GET /.well-known/openid-configuration") {
+						discovery
+					} else {
+						json!({ "active": true, "sub": "tls-subject" }).to_string()
+					};
+					let response = format!(
+						"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+						body.len()
+					);
+					tls.write_all(response.as_bytes()).await.ok();
+					tls.shutdown().await.ok();
+				});
+			}
+		});
+		(iss, ca.pem())
+	}
+
+	fn write_temp(contents: &str) -> std::path::PathBuf {
+		let path = std::env::temp_dir().join(format!(
+			"zapp-test-ca-{}-{}.pem",
+			std::process::id(),
+			std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()
+		));
+		std::fs::write(&path, contents).unwrap();
+		path
+	}
+
+	fn verification(ca_file: Option<std::path::PathBuf>) -> VerificationConfig {
+		VerificationConfig { audience: "zapp".to_string(), timeout_secs: 5, ca_file }
+	}
+
+	#[tokio::test]
+	async fn trusts_a_configured_ca_bundle() {
+		let (iss, ca_pem) = tls_issuer().await;
+		let token = jwt_with_payload(&json!({ "iss": iss, "aud": "zapp", "sub": "x" }).to_string());
+
+		let untrusting = DomainVerifier::new(&verification(None), false).unwrap();
+		assert!(
+			matches!(untrusting.verify(&token).await, Err(VerifyError::Discovery { .. })),
+			"the test CA must not be trusted by default"
+		);
+
+		//= docs/requirements/zapp.md#ca-1
+		//= type=test
+		//# If a CA bundle is configured, zapp MUST trust its certificates for
+		//# discovery, introspection and JWKS requests, in addition to the
+		//# system's trusted roots.
+		let ca_file = write_temp(&ca_pem);
+		let trusting = DomainVerifier::new(&verification(Some(ca_file.clone())), false).unwrap();
+		std::fs::remove_file(ca_file).ok();
+		let claims = trusting.verify(&token).await.expect("verified over TLS");
+		assert_eq!(claims.subject.as_deref(), Some("tls-subject"));
+	}
+
+	#[test]
+	fn rejects_unusable_ca_bundles() {
+		//= docs/requirements/zapp.md#ca-1
+		//= type=test
+		//# zapp MUST refuse to start if the configured CA bundle cannot be read
+		//# or contains no certificate.
+		let missing = std::env::temp_dir().join("zapp-test-ca-does-not-exist.pem");
+		assert!(DomainVerifier::new(&verification(Some(missing)), false).is_err());
+		let empty = write_temp("not a certificate\n");
+		assert!(DomainVerifier::new(&verification(Some(empty.clone())), false).is_err());
+		std::fs::remove_file(empty).ok();
+	}
+
 	#[test]
 	fn rejects_bare_domain_issuer() {
 		// The issuer must be a full URL, as in OpenID Connect.
@@ -750,7 +901,7 @@ mod tests {
 			&json!({ "iss": iss, "aud": AUDIENCE, "sub": "from-payload" }).to_string(),
 		);
 		let verifier = DomainVerifier::new(
-			&VerificationConfig { audience: AUDIENCE.to_string(), timeout_secs: 5 },
+			&VerificationConfig { audience: AUDIENCE.to_string(), timeout_secs: 5, ca_file: None },
 			true,
 		)
 		.unwrap();

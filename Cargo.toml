@@ -35,5 +35,7 @@ url = { version = "2", features = ["serde"] }
 aws-lc-rs = "1"
 p256 = { version = "0.13", features = ["pem"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
+rcgen = "0.14"
+tokio-rustls = "0.26"
 tower = { version = "0.5", features = ["util"] }
 wiremock = "0.6"

@@ -381,7 +381,11 @@ mod tests {
 		let subjects = resolver.subjects.clone();
 		let state = Arc::new(AppState {
 			verifier: DomainVerifier::new(
-				&VerificationConfig { audience: "zapp".to_string(), timeout_secs: 5 },
+				&VerificationConfig {
+					audience: "zapp".to_string(),
+					timeout_secs: 5,
+					ca_file: None,
+				},
 				true,
 			)
 			.unwrap(),
