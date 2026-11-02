@@ -253,7 +253,7 @@ impl Config {
 			}) {
 				//= docs/requirements/zapp.md#org-roles-2
 				//# zapp MUST refuse to start if an organisation role of a grant
-				//# does not start with ORG_ or contains characters other than
+				//# does not start with `ORG_` or contains characters other than
 				//# upper-case letters and underscores.
 				anyhow::bail!(
 					"grant pattern {:?} has invalid org role {role:?}: Zitadel organisation roles look like ORG_USER_MANAGER",
@@ -461,7 +461,7 @@ org_id = "123456789012345678"
 		//= docs/requirements/zapp.md#org-roles-2
 		//= type=test
 		//# zapp MUST refuse to start if an organisation role of a grant does
-		//# not start with ORG_ or contains characters other than upper-case
+		//# not start with `ORG_` or contains characters other than upper-case
 		//# letters and underscores.
 		for role in ["", "ORG_", "org_user_manager", "ORG USER", "IAM_OWNER", "PROJECT_OWNER"] {
 			let toml = MINIMAL.to_string() + &format!("org_roles = [\"{role}\"]\n");

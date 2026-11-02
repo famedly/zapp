@@ -23,16 +23,17 @@ is verified:
   own, serve the discovery documents publicly, and mint tokens with
   `kubectl create token <sa> --audience=zapp` (or a projected volume).
 
-The issuer is matched against a configurable ruleset; each rule names the
-Zitadel organisation it entitles to. Keep production patterns on `https://` (an
-http ownership proof can be spoofed on the network) and reserve `http://` for
-local testing.
+The issuer (and, optionally, the token's subject) is matched against a
+configurable ruleset; each rule names the Zitadel organisation it entitles to.
+Keep production patterns on `https://` (an http ownership proof can be spoofed
+on the network) and reserve `http://` for local testing.
 
 In exchange, zapp creates in that organisation a **service account** named after
-the issuer, a **project** of the same name, makes the service account **project
-owner**, and returns a credential for it: a personal access token or, on
-request, a machine key. With that the client can manage its project
-(applications, roles, grants, ...) through the Zitadel API on its own.
+the issuer (and subject, for subject-scoped grants), a **project** of the same
+name, makes the service account **project owner**, and returns a credential for
+it: a personal access token or, on request, a machine key. With that the client
+can manage its project (applications, roles, grants, ...) through the Zitadel
+API on its own.
 
 ```
 client                         zapp                        client's issuer       Zitadel
@@ -65,9 +66,9 @@ zapp [path/to/zapp.toml]    # defaults to ./zapp.toml
 zapp authenticates against Zitadel as a service user with a private key JSON
 file (`zitadel.key_file`). That service user must be able to manage users,
 projects and project members in every organisation named by a grant:
-`IAM_OWNER`, or `ORG_OWNER` on each of those organisations. If any grant sets
-`instance_roles`, it needs `IAM_OWNER`. See
-[`zapp.example.toml`](zapp.example.toml) for all options.
+`IAM_OWNER`, or `ORG_OWNER` on each of those organisations (which also covers
+granting `org_roles`). If any grant sets `instance_roles`, it needs `IAM_OWNER`.
+See [`zapp.example.toml`](zapp.example.toml) for all options.
 
 ## API
 
@@ -116,8 +117,8 @@ Zitadel instance at `zitadel_url`.
 
 Errors: `400` (`invalid_query`: unknown `type`), `401` (token
 missing/invalid/inactive, verification failure), `403` (`issuer_not_entitled`:
-no configured pattern matches), `502` (Zitadel unreachable or rejected the
-request).
+no configured pattern matches; `subject_not_usable`: subject too long for a
+name), `502` (Zitadel unreachable or rejected the request).
 
 Renewal: simply call the endpoint again. zapp adopts the existing service
 account and project (reactivating them if garbage collection has deactivated
@@ -142,25 +143,40 @@ Every step is optimistic and converges under concurrent requests:
 1. **Grant instance roles**, only if the grant sets `instance_roles`: the
    account becomes an instance member with exactly those roles (on
    `409 Conflict` its roles are overwritten).
+1. **Grant organisation roles**, only if the grant sets `org_roles`: the account
+   becomes a member of the grant's organisation with exactly those roles (on
+   `409 Conflict` its roles there are overwritten).
 1. **Issue the credential** with the grant's expiry.
 
 #### Trust model
 
 The issued credential acts as the service account, which holds only
-`PROJECT_OWNER` on its project, plus any `instance_roles` its grant names.
-Instance roles reach across every organisation (`IAM_OWNER_VIEWER`, for example,
-reads all users), so they are only accepted on grants for an exact issuer, never
-on a wildcard pattern. Removing them from a grant does not revoke memberships
-already granted; they go when garbage collection deletes the account, or by
-hand. Tested against Zitadel, that lets it rename itself (`UpdateMyUserName`),
-remove its own project membership and delete its project, but _not_ write its
-own metadata (`SetUserMetadata` needs `user.write`; the auth API has no metadata
-write at all). zapp therefore relies on nothing the account can change:
+`PROJECT_OWNER` on its project, plus any `instance_roles` and `org_roles` its
+grant names. Instance roles reach across every organisation (`IAM_OWNER_VIEWER`,
+for example, reads all users), so they are only accepted on grants for an exact
+issuer, never on a wildcard pattern. The same holds for organisation roles: they
+reach every user (or project) of the grant's organisation, so a wildcard issuer
+pattern, which can match issuers run by unrelated parties, may not carry them; a
+wildcard _subject_ pattern can (all subjects come from the one exact issuer).
+Removing either from a grant does not revoke memberships already granted; they
+go when garbage collection deletes the account, or by hand. Tested against
+Zitadel, `PROJECT_OWNER` alone lets the account rename itself
+(`UpdateMyUserName`), remove its own project membership and delete its project,
+but _not_ write its own metadata (`SetUserMetadata` needs `user.write`; the auth
+API has no metadata write at all). zapp therefore relies on nothing the account
+can change:
 
 - Accounts are recognised by `origin` metadata, not by name.
 - Projects are tracked by `creator.*` metadata, not by membership. A
   `PROJECT_OWNER` that removes its own membership does not exempt its project
   from cleanup; a project deleted by the account is simply found gone.
+
+This no longer holds for an account whose `org_roles` include writing users
+(`ORG_USER_MANAGER`, `ORG_OWNER`): it can write the metadata of every user in
+its organisation, its own included, and thereby make zapp remove any project of
+that organisation (by recording it as `creator.*`) or adopt other accounts into
+garbage collection. Only grant such roles in an organisation whose users and
+projects all belong to the party the account acts for (e.g. one tenant).
 
 ### Garbage collection
 
@@ -197,7 +213,38 @@ segment, `/**/` once per path for any number of segments). Each grant names the
 Zitadel organisation (`org_id`) to provision in and may set a token `duration`
 (humantime syntax such as `"12h"`), falling back to `zitadel.default_duration`.
 A grant for an exact issuer may also set `instance_roles` (e.g.
-`["IAM_OWNER_VIEWER"]`), see the trust model above.
+`["IAM_OWNER_VIEWER"]`) and `org_roles` (e.g. `["ORG_USER_MANAGER"]`, roles
+starting with `ORG_`), see the trust model above.
+
+### Subject-scoped grants
+
+All workloads of one issuer share it: on a Kubernetes cluster every pod's token
+has the cluster's issuer. A grant may therefore set `subject`, a pattern over
+the token's `sub` claim. It then only matches tokens whose subject matches, and
+every pair of issuer and subject gets its own service account and project. With
+one grant per tenant, each tenant's workloads land in its own organisation:
+
+```toml
+[[grants]]
+pattern = "https://k8s.example.com"
+subject = "system:serviceaccount:tenant-a:*"
+org_id = "111111111111111111"
+org_roles = ["ORG_USER_MANAGER"]
+```
+
+The subject is split at `:` and matched segment by segment like an issuer path:
+`*` once per segment (never across a `:`), `**` as its own segment for any
+number of segments; e.g. `system:serviceaccount:tenant-*:admin-api`. Subjects
+without `:` (other issuers use numeric IDs, UUIDs, `provider|id`, ...) are a
+single segment, so this works for any issuer, not only Kubernetes.
+
+Only a verified subject is used: from the claims of a token whose signature was
+validated against the JWKS, or from the `sub` of the introspection response —
+never from the payload of an introspected token. A token without a (non-empty)
+verified subject never matches a subject-scoped grant. Grants without `subject`
+ignore the subject entirely and behave as before; order grants from specific to
+general, since the first match wins. The `PermissionResolver` receives the
+verified subject too.
 
 Because the scheme is part of the pattern, allowing plain-http issuers is an
 explicit opt-in per grant (on top of the `account_prefix_http` opt-in). Only use
@@ -222,6 +269,15 @@ Examples (with prefixes `zapp/` and `zapp-insecure/`):
 `https://app.famedly.dev/k8s/c1` → `zapp/app.famedly.dev/k8s/c1`,
 `http://localhost:39231/` → `zapp-insecure/localhost:39231`.
 
+For a subject-scoped grant, `#<subject>` is appended:
+`zapp/k8s.example.com#system:serviceaccount:tenant-a:admin-api`. Every byte of
+the subject outside `a-z`, `0-9`, `:`, `.`, `_`, `-` is percent-encoded
+(`Auth0|x` → `%41uth0%7cx`), so names stay unambiguous and subjects differing
+only in case get distinct accounts. Prefixes may not contain `#`. A subject
+whose name would exceed 200 characters (Zitadel's limit) is rejected with
+`403 subject_not_usable`. Garbage collection handles these accounts like any
+other: each is collected on its own.
+
 ## Mock client
 
 `examples/mock_client.rs` spins up a local plain-http issuer with an
@@ -240,5 +296,13 @@ with the pattern `http://localhost:*` (see `zapp.example.toml`).
 ## Future work
 
 Dynamic entitlements: the `PermissionResolver` trait (`src/policy.rs`) is the
-extension point for querying a third-party server about an issuer and
-translating the response to an organisation, complementing the static patterns.
+extension point for querying a third-party server about an issuer and verified
+subject and translating the response to an organisation, complementing the
+static patterns.
+
+## Requirements
+
+[`docs/requirements/zapp.md`](docs/requirements/zapp.md) states the requirements
+on organisation roles and subject-scoped grants. They are traced to code and
+tests with [Duvet](https://github.com/awslabs/duvet): `duvet report --ci` fails
+if the committed `.duvet/snapshot.txt` is out of date.

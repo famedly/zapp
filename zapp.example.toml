@@ -15,7 +15,8 @@ url = "https://auth.example.com"
 # on each of those organisations.
 key_file = "/run/secrets/zapp-key.json"
 # Service accounts and projects are named
-# "<prefix><host>[:<port>][/<path>]" (e.g. "zapp/app.famedly.dev/k8s"):
+# "<prefix><host>[:<port>][/<path>]" (e.g. "zapp/app.famedly.dev/k8s"),
+# plus "#<subject>" for subject-scoped grants:
 # the issuer URL with "<scheme>://" replaced verbatim by a prefix chosen
 # by scheme. No separator is inserted, so include a trailing "/" (or
 # similar) in the prefix if one is wanted.
@@ -89,3 +90,19 @@ duration = "12h"
 # pattern = "https://central.example.com/k8s"
 # org_id = "123456789012345678"
 # instance_roles = ["IAM_OWNER_VIEWER"]
+
+# Workloads of one issuer told apart by their token subject (sub), e.g. one
+# grant per tenant namespace on a Kubernetes cluster. `subject` is matched
+# segment by segment at ':' ('*' once per segment, "**" as its own segment
+# for any number of segments); only a verified subject is used. Each issuer
+# and subject pair gets its own service account and project, named
+# "<prefix><issuer>#<subject>". org_roles make the service account a member
+# of org_id with exactly these roles (exact issuer only, like
+# instance_roles). Put subject-scoped grants before a catch-all grant for
+# the same issuer: the first match wins.
+#
+# [[grants]]
+# pattern = "https://k8s.example.com"
+# subject = "system:serviceaccount:tenant-a:*"
+# org_id = "111111111111111111"
+# org_roles = ["ORG_USER_MANAGER"]

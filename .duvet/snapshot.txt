@@ -4,7 +4,7 @@ SPECIFICATION: [zapp requirements](docs/requirements/zapp.md)
     TEXT[!MUST,implementation,test]: If the service account already is a member of that organisation, zapp MUST replace its roles there with the grant's organisation roles.
 
   SECTION: [ORG-ROLES-2](#org-roles-2)
-    TEXT[!MUST,implementation,test]: zapp MUST refuse to start if an organisation role of a grant does not start with ORG_ or contains characters other than upper-case letters and underscores.
+    TEXT[!MUST,implementation,test]: zapp MUST refuse to start if an organisation role of a grant does not start with `ORG_` or contains characters other than upper-case letters and underscores.
     TEXT[!MUST,implementation,test]: zapp MUST refuse to start if a grant names organisation roles and its issuer pattern contains a wildcard.
 
   SECTION: [SUBJECT-1](#subject-1)

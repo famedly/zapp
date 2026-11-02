@@ -9,8 +9,8 @@
 pattern = "src/**/*.rs"
 
 [[specification]]
-source = "docs/requirements/zapp.md"
 format = "markdown"
+source = "docs/requirements/zapp.md"
 
 [report.html]
 enabled = true

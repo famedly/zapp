@@ -28,7 +28,7 @@ If the service account already is a member of that organisation, zapp MUST repla
 
 ### ORG-ROLES-2
 
-zapp MUST refuse to start if an organisation role of a grant does not start with ORG_ or contains characters other than upper-case letters and underscores.
+zapp MUST refuse to start if an organisation role of a grant does not start with `ORG_` or contains characters other than upper-case letters and underscores.
 
 zapp MUST refuse to start if a grant names organisation roles and its issuer pattern contains a wildcard.
 
@@ -66,4 +66,4 @@ zapp MUST reject a subject if the resulting name would be longer than 200 charac
 
 ### SUBJECT-4
 
-zapp MUST pass the verified subject to the permission resolver. 
+zapp MUST pass the verified subject to the permission resolver.
