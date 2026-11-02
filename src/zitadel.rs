@@ -39,6 +39,11 @@ const PROJECT_OWNER: &str = "PROJECT_OWNER";
 /// was provisioned for. Its presence marks the account as zapp-managed.
 pub const METADATA_ORIGIN: &str = "origin";
 
+/// Metadata key on a service account of a subject-scoped grant holding the
+/// verified subject it was provisioned for. For auditing only: the account
+/// may be able to overwrite it (see `org_roles`), so zapp never acts on it.
+pub const METADATA_SUBJECT: &str = "subject";
+
 /// Metadata key prefix `creator.<project id>` (value `1`) recording that the
 /// service account was provisioned as creator of that project.
 pub const METADATA_CREATOR_PREFIX: &str = "creator.";
@@ -226,10 +231,12 @@ impl ZitadelClient {
 		entitlement: &Entitlement,
 		credential_type: CredentialType,
 	) -> anyhow::Result<Provisioned> {
-		let Entitlement { org_id, duration, instance_roles, org_roles, .. } = entitlement;
+		let Entitlement { org_id, duration, instance_roles, org_roles, subject } = entitlement;
 		let org_id = org_id.as_str();
 		let project_id = self.ensure_project(name, org_id).await?;
-		let user_id = self.ensure_service_account(name, issuer, org_id, &project_id).await?;
+		let user_id = self
+			.ensure_service_account(name, issuer, subject.as_deref(), org_id, &project_id)
+			.await?;
 		self.ensure_project_owner(org_id, &project_id, &user_id).await?;
 		// ponytail: a grant whose instance_roles were removed leaves existing
 		// memberships in place until GC deletes the account. Revoking them
@@ -294,11 +301,16 @@ impl ZitadelClient {
 		&self,
 		name: &str,
 		issuer: &str,
+		subject: Option<&str>,
 		org_id: &str,
 		project_id: &str,
 	) -> anyhow::Result<String> {
 		let creator_key = format!("{METADATA_CREATOR_PREFIX}{project_id}");
-		let metadata = [(METADATA_ORIGIN, issuer), (creator_key.as_str(), "1")];
+		//= docs/requirements/zapp.md#audit-1
+		//# zapp MUST record the verified issuer in the metadata of the service
+		//# account, and for a subject-scoped grant also the verified subject.
+		let mut metadata = vec![(METADATA_ORIGIN, issuer), (creator_key.as_str(), "1")];
+		metadata.extend(subject.map(|subject| (METADATA_SUBJECT, subject)));
 
 		let body = json!({
 			"userName": name,
@@ -602,6 +614,9 @@ impl ZitadelClient {
 				continue;
 			}
 			let metadata = self.user_metadata(user_id, org_id).await?;
+			//= docs/requirements/zapp.md#audit-1
+			//# zapp MUST NOT use the recorded subject to recognise, adopt or
+			//# garbage collect service accounts.
 			let Some(origin) = metadata.get(METADATA_ORIGIN) else { continue };
 			accounts.push(ManagedAccount {
 				user_id: user_id.clone(),
@@ -987,6 +1002,60 @@ pub(crate) mod tests {
 			.mount(&server)
 			.await;
 		client.ensure_org_member(ORG_ID, USER_ID, &roles()).await.expect("nothing to change");
+	}
+
+	#[tokio::test]
+	async fn accounts_are_not_recognised_by_subject_metadata() {
+		let server = MockServer::start().await;
+		let client = test_client(&server).await;
+		let machine = |id: &str| {
+			json!({
+				"userId": id,
+				"username": format!("zapp/k8s.example.com#{id}"),
+				"state": "USER_STATE_ACTIVE",
+				"machine": { "name": id },
+			})
+		};
+		Mock::given(method("POST"))
+			.and(path("/v2/users"))
+			.respond_with(
+				ResponseTemplate::new(200)
+					.set_body_json(json!({ "result": [machine("1"), machine("2")] })),
+			)
+			.mount(&server)
+			.await;
+		let metadata = |entries: &[(&str, &str)]| {
+			let result: Vec<_> = entries
+				.iter()
+				.map(|(key, value)| json!({ "key": key, "value": BASE64_STANDARD.encode(value) }))
+				.collect();
+			ResponseTemplate::new(200).set_body_json(json!({ "result": result }))
+		};
+		// Account 1 only carries a subject (e.g. written by an account that
+		// can write user metadata); account 2 is zapp's.
+		Mock::given(method("POST"))
+			.and(path("/management/v1/users/1/metadata/_search"))
+			.respond_with(metadata(&[("subject", "system:serviceaccount:a:b")]))
+			.mount(&server)
+			.await;
+		Mock::given(method("POST"))
+			.and(path("/management/v1/users/2/metadata/_search"))
+			.respond_with(metadata(&[
+				("origin", "https://k8s.example.com"),
+				("subject", "system:serviceaccount:a:c"),
+				("creator.10", "1"),
+			]))
+			.mount(&server)
+			.await;
+
+		//= docs/requirements/zapp.md#audit-1
+		//= type=test
+		//# zapp MUST NOT use the recorded subject to recognise, adopt or
+		//# garbage collect service accounts.
+		let accounts = client.list_managed_accounts(ORG_ID).await.expect("listing accounts");
+		let ids: Vec<_> = accounts.iter().map(|account| account.user_id.as_str()).collect();
+		assert_eq!(ids, ["2"]);
+		assert_eq!(accounts[0].project_ids, ["10"]);
 	}
 
 	#[tokio::test]

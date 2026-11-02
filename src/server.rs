@@ -273,7 +273,7 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 
 #[cfg(test)]
 mod tests {
-	use std::sync::Mutex;
+	use std::{collections::BTreeMap, sync::Mutex};
 
 	use axum::body::Body;
 	use base64::{Engine as _, engine::general_purpose::URL_SAFE_NO_PAD};
@@ -281,7 +281,7 @@ mod tests {
 	use tower::ServiceExt as _;
 	use wiremock::{
 		Mock, MockServer, ResponseTemplate,
-		matchers::{body_partial_json, method, path, path_regex},
+		matchers::{body_partial_json, method, path},
 	};
 
 	use super::*;
@@ -316,6 +316,25 @@ mod tests {
 				subject: subject.map(str::to_string),
 			})
 		}
+	}
+
+	/// The decoded metadata of a `metadata/_bulk` request.
+	fn metadata_of(request: &wiremock::Request) -> BTreeMap<String, String> {
+		let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap_or_default();
+		body["metadata"]
+			.as_array()
+			.into_iter()
+			.flatten()
+			.map(|entry| {
+				let value = base64::prelude::BASE64_STANDARD
+					.decode(entry["value"].as_str().unwrap_or_default())
+					.unwrap_or_default();
+				(
+					entry["key"].as_str().unwrap_or_default().to_string(),
+					String::from_utf8(value).unwrap_or_default(),
+				)
+			})
+			.collect()
 	}
 
 	#[tokio::test]
@@ -360,8 +379,24 @@ mod tests {
 			.mount(&zitadel)
 			.await;
 		Mock::given(method("POST"))
-			.and(path_regex("^/management/v1/(users/20/metadata/_bulk|projects/10/members)$"))
+			.and(path("/management/v1/projects/10/members"))
 			.respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+			.mount(&zitadel)
+			.await;
+		//= docs/requirements/zapp.md#audit-1
+		//= type=test
+		//# zapp MUST record the verified issuer in the metadata of the service
+		//# account, and for a subject-scoped grant also the verified subject.
+		let expected_metadata = BTreeMap::from([
+			("origin".to_string(), iss.clone()),
+			("creator.10".to_string(), "1".to_string()),
+			("subject".to_string(), subject.to_string()),
+		]);
+		Mock::given(method("POST"))
+			.and(path("/management/v1/users/20/metadata/_bulk"))
+			.and(move |request: &wiremock::Request| metadata_of(request) == expected_metadata)
+			.respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+			.expect(1)
 			.mount(&zitadel)
 			.await;
 		Mock::given(method("POST"))
