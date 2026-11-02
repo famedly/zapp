@@ -48,6 +48,9 @@
           # treefmt.toml does not contain nix store paths. The package
           # is put on PATH through the prek wrapper and the devshell.
           settings.formatter.mdformat.command = "mdformat";
+          # Duvet reads every line of a requirements paragraph as a
+          # separate requirement, so these keep one paragraph per line.
+          settings.formatter.mdformat.excludes = [ "docs/requirements/*.md" ];
         };
 
         # Check licensing information (SPDX headers and REUSE.toml)

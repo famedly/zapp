@@ -18,5 +18,6 @@ path = [
   "treefmt.toml",
   "rustfmt.toml",
   ".direnv/*",
+  ".duvet/snapshot.txt",
 ]
 precedence = "aggregate"

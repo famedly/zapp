@@ -37,7 +37,7 @@ walk = "git"
 
 [formatter.mdformat]
 command = "mdformat"
-excludes = []
+excludes = ["docs/requirements/*.md"]
 includes = ["*.md"]
 options = ["--wrap", "80"]
 

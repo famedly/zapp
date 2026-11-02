@@ -1,0 +1,22 @@
+# SPDX-FileCopyrightText: 2026 Famedly GmbH (info@famedly.com)
+#
+# SPDX-License-Identifier: AGPL-3.0-or-later
+
+'$schema' = "https://awslabs.github.io/duvet/config/v0.4.0.json"
+
+# Requirements are extracted from the RFC 2119 keywords in the spec.
+[[source]]
+pattern = "src/**/*.rs"
+
+[[specification]]
+source = "docs/requirements/zapp.md"
+format = "markdown"
+
+[report.html]
+enabled = true
+
+[report.json]
+enabled = true
+
+[report.snapshot]
+enabled = true
