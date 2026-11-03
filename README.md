@@ -265,7 +265,10 @@ When zapp runs inside a Kubernetes cluster and the issuer is the API server
 itself (e.g. `https://kubernetes.default.svc`), set `verification.ca_file` to
 the cluster CA (`/var/run/secrets/kubernetes.io/serviceaccount/ca.crt`): its
 certificates are trusted for discovery, introspection and JWKS requests on top
-of the system roots. zapp fetches discovery and JWKS without credentials, so the
+of the system roots. Set `verification.ca_hosts` to the issuer hostnames that
+need it (e.g. `["kubernetes.default.svc"]`): every other issuer is then verified
+against the system roots only. Without `ca_hosts` the CA is trusted for every
+issuer, and zapp logs a warning at startup. zapp fetches discovery and JWKS without credentials, so the
 API server must allow anonymous requests to them, e.g. by binding the
 `system:service-account-issuer-discovery` ClusterRole to
 `system:unauthenticated` (by default it is bound to service accounts only).

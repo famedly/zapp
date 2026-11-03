@@ -150,7 +150,13 @@ const MAX_NAME_LENGTH: usize = 200;
 /// configured; beyond that, it is the operator's responsibility to only
 /// configure `https://` grant patterns unless plain http is really wanted.
 pub struct DomainVerifier {
+	/// Client trusting the system roots, plus the CA bundle if no CA hosts
+	/// are configured.
 	http: reqwest::Client,
+	/// Client additionally trusting the CA bundle, used only for issuers on
+	/// `ca_hosts`.
+	ca_http: Option<reqwest::Client>,
+	ca_hosts: Vec<String>,
 	/// Audience every token must carry, regardless of verification path.
 	audience: String,
 	/// Whether plain-http issuers are verified at all (true iff an http
@@ -169,30 +175,77 @@ struct DiscoveryMetadata {
 
 impl DomainVerifier {
 	pub fn new(config: &VerificationConfig, allow_http: bool) -> anyhow::Result<Self> {
-		let mut builder = reqwest::Client::builder()
-			.timeout(Duration::from_secs(config.timeout_secs))
-			.redirect(reqwest::redirect::Policy::none());
-		if let Some(ca_file) = &config.ca_file {
+		let builder = || {
+			reqwest::Client::builder()
+				.timeout(Duration::from_secs(config.timeout_secs))
+				.redirect(reqwest::redirect::Policy::none())
+		};
+		//= docs/requirements/zapp.md#ca-1
+		//# zapp MUST refuse to start if CA hosts are configured without a CA
+		//# bundle or a CA host is not a valid hostname.
+		anyhow::ensure!(
+			config.ca_hosts.is_empty() || config.ca_file.is_some(),
+			"verification.ca_hosts is set without verification.ca_file"
+		);
+		if let Some(host) = config.ca_hosts.iter().find(|host| !is_valid_domain(host)) {
+			anyhow::bail!("verification.ca_hosts entry {host:?} is not a lower-case hostname");
+		}
+		let Some(ca_file) = &config.ca_file else {
+			return Ok(Self {
+				http: builder().build()?,
+				ca_http: None,
+				ca_hosts: Vec::new(),
+				audience: config.audience.clone(),
+				allow_http,
+			});
+		};
+		//= docs/requirements/zapp.md#ca-1
+		//# zapp MUST refuse to start if the configured CA bundle cannot be
+		//# read or contains no certificate.
+		let pem = std::fs::read(ca_file)
+			.with_context(|| format!("reading verification.ca_file {}", ca_file.display()))?;
+		let certs = reqwest::Certificate::from_pem_bundle(&pem)
+			.with_context(|| format!("parsing verification.ca_file {}", ca_file.display()))?;
+		anyhow::ensure!(
+			!certs.is_empty(),
+			"verification.ca_file {} contains no certificate",
+			ca_file.display()
+		);
+		let with_ca = builder().tls_certs_merge(certs).build()?;
+		let (http, ca_http) = if config.ca_hosts.is_empty() {
 			//= docs/requirements/zapp.md#ca-1
-			//# zapp MUST refuse to start if the configured CA bundle cannot be
-			//# read or contains no certificate.
-			let pem = std::fs::read(ca_file)
-				.with_context(|| format!("reading verification.ca_file {}", ca_file.display()))?;
-			let certs = reqwest::Certificate::from_pem_bundle(&pem)
-				.with_context(|| format!("parsing verification.ca_file {}", ca_file.display()))?;
-			anyhow::ensure!(
-				!certs.is_empty(),
-				"verification.ca_file {} contains no certificate",
-				ca_file.display()
+			//# zapp SHOULD warn at startup if a CA bundle is configured without
+			//# CA hosts.
+			tracing::warn!(
+				"verification.ca_file is trusted for every issuer; set verification.ca_hosts to limit it to the hosts that need it"
 			);
 			//= docs/requirements/zapp.md#ca-1
-			//# If a CA bundle is configured, zapp MUST trust its certificates
-			//# for discovery, introspection and JWKS requests, in addition to
-			//# the system's trusted roots.
-			builder = builder.tls_certs_merge(certs);
+			//# If a CA bundle is configured without CA hosts, zapp MUST trust its
+			//# certificates for discovery, introspection and JWKS requests to
+			//# every issuer, in addition to the system's trusted roots.
+			(with_ca, None)
+		} else {
+			(builder().build()?, Some(with_ca))
+		};
+		Ok(Self {
+			http,
+			ca_http,
+			ca_hosts: config.ca_hosts.clone(),
+			audience: config.audience.clone(),
+			allow_http,
+		})
+	}
+
+	/// The client for requests to the issuer on `domain`.
+	fn client(&self, domain: &str) -> &reqwest::Client {
+		//= docs/requirements/zapp.md#ca-1
+		//# If CA hosts are configured, zapp MUST trust the CA bundle only for
+		//# requests to issuers on these hosts and MUST use only the system's
+		//# trusted roots for every other issuer.
+		match &self.ca_http {
+			Some(ca_http) if self.ca_hosts.iter().any(|host| host == domain) => ca_http,
+			_ => &self.http,
 		}
-		let http = builder.build()?;
-		Ok(Self { http, audience: config.audience.clone(), allow_http })
 	}
 
 	/// Verifies the token and returns the proven issuer claims.
@@ -230,7 +283,7 @@ impl DomainVerifier {
 
 	async fn fetch_discovery(&self, issuer: &TokenClaims) -> reqwest::Result<DiscoveryMetadata> {
 		let url = issuer.discovery_url();
-		let response = self.http.get(&url).send().await?.error_for_status()?;
+		let response = self.client(&issuer.domain).get(&url).send().await?.error_for_status()?;
 		response.json().await
 	}
 
@@ -266,7 +319,7 @@ impl DomainVerifier {
 		}
 
 		let response = self
-			.http
+			.client(domain)
 			.post(endpoint)
 			.form(&[("token", token)])
 			.send()
@@ -332,7 +385,7 @@ impl DomainVerifier {
 		let discovery =
 			|reason: String| VerifyError::Discovery { domain: issuer.domain.clone(), reason };
 		let response = self
-			.http
+			.client(&issuer.domain)
 			.get(jwks_url)
 			.send()
 			.await
@@ -574,13 +627,21 @@ mod tests {
 	}
 
 	fn verification(ca_file: Option<std::path::PathBuf>) -> VerificationConfig {
-		VerificationConfig { audience: "zapp".to_string(), timeout_secs: 5, ca_file }
+		VerificationConfig { ca_file, ..VerificationConfig::default() }
 	}
 
 	#[tokio::test]
 	async fn trusts_a_configured_ca_bundle() {
 		let (iss, ca_pem) = tls_issuer().await;
 		let token = jwt_with_payload(&json!({ "iss": iss, "aud": "zapp", "sub": "x" }).to_string());
+		let ca_file = write_temp(&ca_pem);
+		let with_hosts = |hosts: &[&str]| {
+			let config = VerificationConfig {
+				ca_hosts: hosts.iter().map(|host| host.to_string()).collect(),
+				..verification(Some(ca_file.clone()))
+			};
+			DomainVerifier::new(&config, false).unwrap()
+		};
 
 		let untrusting = DomainVerifier::new(&verification(None), false).unwrap();
 		assert!(
@@ -590,14 +651,27 @@ mod tests {
 
 		//= docs/requirements/zapp.md#ca-1
 		//= type=test
-		//# If a CA bundle is configured, zapp MUST trust its certificates for
-		//# discovery, introspection and JWKS requests, in addition to the
-		//# system's trusted roots.
-		let ca_file = write_temp(&ca_pem);
-		let trusting = DomainVerifier::new(&verification(Some(ca_file.clone())), false).unwrap();
-		std::fs::remove_file(ca_file).ok();
-		let claims = trusting.verify(&token).await.expect("verified over TLS");
+		//# If a CA bundle is configured without CA hosts, zapp MUST trust its
+		//# certificates for discovery, introspection and JWKS requests to
+		//# every issuer, in addition to the system's trusted roots.
+		let claims = with_hosts(&[]).verify(&token).await.expect("verified over TLS");
 		assert_eq!(claims.subject.as_deref(), Some("tls-subject"));
+
+		//= docs/requirements/zapp.md#ca-1
+		//= type=test
+		//# If CA hosts are configured, zapp MUST trust the CA bundle only for
+		//# requests to issuers on these hosts and MUST use only the system's
+		//# trusted roots for every other issuer.
+		let claims = with_hosts(&["localhost"]).verify(&token).await.expect("CA host");
+		assert_eq!(claims.subject.as_deref(), Some("tls-subject"));
+		assert!(
+			matches!(
+				with_hosts(&["kubernetes.default.svc"]).verify(&token).await,
+				Err(VerifyError::Discovery { .. })
+			),
+			"the CA must not be trusted for other hosts"
+		);
+		std::fs::remove_file(ca_file).ok();
 	}
 
 	#[test]
@@ -611,6 +685,26 @@ mod tests {
 		let empty = write_temp("not a certificate\n");
 		assert!(DomainVerifier::new(&verification(Some(empty.clone())), false).is_err());
 		std::fs::remove_file(empty).ok();
+	}
+
+	#[tokio::test]
+	async fn rejects_unusable_ca_hosts() {
+		//= docs/requirements/zapp.md#ca-1
+		//= type=test
+		//# zapp MUST refuse to start if CA hosts are configured without a CA
+		//# bundle or a CA host is not a valid hostname.
+		let hosts = |host: &str| vec![host.to_string()];
+		let without_ca =
+			VerificationConfig { ca_hosts: hosts("localhost"), ..VerificationConfig::default() };
+		assert!(DomainVerifier::new(&without_ca, false).is_err());
+		let (_, ca_pem) = tls_issuer().await;
+		let ca_file = write_temp(&ca_pem);
+		for host in ["", "Localhost", "localhost:443", "*.example.com"] {
+			let config =
+				VerificationConfig { ca_hosts: hosts(host), ..verification(Some(ca_file.clone())) };
+			assert!(DomainVerifier::new(&config, false).is_err(), "{host:?}");
+		}
+		std::fs::remove_file(ca_file).ok();
 	}
 
 	#[test]
@@ -901,7 +995,7 @@ mod tests {
 			&json!({ "iss": iss, "aud": AUDIENCE, "sub": "from-payload" }).to_string(),
 		);
 		let verifier = DomainVerifier::new(
-			&VerificationConfig { audience: AUDIENCE.to_string(), timeout_secs: 5, ca_file: None },
+			&VerificationConfig { audience: AUDIENCE.to_string(), ..VerificationConfig::default() },
 			true,
 		)
 		.unwrap();

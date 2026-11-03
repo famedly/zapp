@@ -72,9 +72,17 @@ zapp MUST pass the verified subject to the permission resolver.
 
 ### CA-1
 
-If a CA bundle is configured, zapp MUST trust its certificates for discovery, introspection and JWKS requests, in addition to the system's trusted roots.
+A CA bundle can be limited to a list of CA hosts.
+
+If a CA bundle is configured without CA hosts, zapp MUST trust its certificates for discovery, introspection and JWKS requests to every issuer, in addition to the system's trusted roots.
+
+If CA hosts are configured, zapp MUST trust the CA bundle only for requests to issuers on these hosts and MUST use only the system's trusted roots for every other issuer.
+
+zapp SHOULD warn at startup if a CA bundle is configured without CA hosts.
 
 zapp MUST refuse to start if the configured CA bundle cannot be read or contains no certificate.
+
+zapp MUST refuse to start if CA hosts are configured without a CA bundle or a CA host is not a valid hostname.
 
 ## Accounts
 

@@ -415,15 +415,7 @@ mod tests {
 		let resolver = RecordingResolver::default();
 		let subjects = resolver.subjects.clone();
 		let state = Arc::new(AppState {
-			verifier: DomainVerifier::new(
-				&VerificationConfig {
-					audience: "zapp".to_string(),
-					timeout_secs: 5,
-					ca_file: None,
-				},
-				true,
-			)
-			.unwrap(),
+			verifier: DomainVerifier::new(&VerificationConfig::default(), true).unwrap(),
 			resolver: Box::new(resolver),
 			zitadel: Arc::new(client),
 			account_prefix_https: "zapp/".to_string(),

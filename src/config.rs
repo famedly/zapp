@@ -84,11 +84,22 @@ pub struct VerificationConfig {
 	/// issuer is the Kubernetes API server.
 	#[serde(default)]
 	pub ca_file: Option<PathBuf>,
+	/// Issuer hostnames for which `ca_file` is trusted, e.g.
+	/// `["kubernetes.default.svc"]`; every other issuer is verified against
+	/// the system roots only. Empty: `ca_file` is trusted for every issuer
+	/// (zapp warns at startup).
+	#[serde(default)]
+	pub ca_hosts: Vec<String>,
 }
 
 impl Default for VerificationConfig {
 	fn default() -> Self {
-		Self { audience: default_audience(), timeout_secs: default_timeout_secs(), ca_file: None }
+		Self {
+			audience: default_audience(),
+			timeout_secs: default_timeout_secs(),
+			ca_file: None,
+			ca_hosts: Vec::new(),
+		}
 	}
 }
 

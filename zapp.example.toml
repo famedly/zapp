@@ -54,6 +54,10 @@ timeout_secs = 10
 # (on top of the system roots), e.g. the cluster CA when zapp runs inside a
 # Kubernetes cluster whose issuer is the API server itself.
 # ca_file = "/var/run/secrets/kubernetes.io/serviceaccount/ca.crt"
+# Issuer hostnames ca_file is trusted for; other issuers are verified against
+# the system roots only. Unset: ca_file is trusted for every issuer (zapp
+# warns at startup).
+# ca_hosts = ["kubernetes.default.svc"]
 
 # Garbage collection of service accounts whose issuer stopped renewing.
 # Optional: omit the section to disable. An account's age is the time since
