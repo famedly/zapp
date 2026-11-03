@@ -33,7 +33,11 @@ SPECIFICATION: [zapp requirements](docs/requirements/zapp.md)
 
   SECTION: [AUDIT-1](#audit-1)
     TEXT[!MUST,implementation,test]: zapp MUST record the verified issuer in the metadata of the service account, and for a subject-scoped grant also the verified subject.
-    TEXT[!MUST,implementation,test]: zapp MUST NOT use the recorded subject to recognise, adopt or garbage collect service accounts.
+    TEXT[!MUST,implementation,test]: zapp MUST NOT use the recorded subject to recognise or garbage collect service accounts.
+
+  SECTION: [ADOPT-1](#adopt-1)
+    TEXT[!MUST,implementation,test]: zapp MUST adopt an existing service account of the requested name only if its recorded issuer equals the verified issuer and its recorded subject equals the subject of a subject-scoped grant, or is absent for a grant without subject pattern.
+    TEXT[!MUST,implementation,test]: Otherwise zapp MUST refuse the request without changing or granting anything to that account.
 
   SECTION: [HOME-ORG-1](#home-org-1)
     TEXT[!MUST,implementation,test]: If no home organisation is configured, zapp MUST create the service account and the project in the grant's organisation.

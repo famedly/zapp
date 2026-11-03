@@ -134,10 +134,14 @@ Every step is optimistic and converges under concurrent requests:
    project of that name is looked up and reactivated if needed.
 1. **Create the service account** of the same name and set metadata on it:
    `origin = <issuer>` marks it as zapp-managed, `subject = <subject>` (only for
-   subject-scoped grants, for auditing; zapp never acts on it),
+   subject-scoped grants),
    `creator.<project id> = 1` records the project it was provisioned for (the ID
    is in the key, so several can coexist). On `409 Conflict` the existing
-   account is adopted: the metadata is added, it is reactivated or unlocked, and
+   account is adopted, but only if its `origin` and `subject` metadata match the
+   request (an account can rename itself, so another issuer's or subject's
+   account could have claimed the name); otherwise the request is refused and
+   nothing is granted. On adoption the metadata is added, it is reactivated or
+   unlocked, and
    any _other_ project recorded in its `creator.*` keys is deleted, so an
    account owns exactly one project. zapp refuses to adopt a human user of that
    name.
@@ -169,7 +173,8 @@ but _not_ write its own metadata (`SetUserMetadata` needs `user.write`; the auth
 API has no metadata write at all). zapp therefore relies on nothing the account
 can change:
 
-- Accounts are recognised by `origin` metadata, not by name.
+- Accounts are recognised by `origin` metadata, not by name. An existing
+  account is adopted by name only if its `origin` and `subject` match.
 - Projects are tracked by `creator.*` metadata, not by membership. A
   `PROJECT_OWNER` that removes its own membership does not exempt its project
   from cleanup; a project deleted by the account is simply found gone.

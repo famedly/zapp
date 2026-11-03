@@ -40,8 +40,10 @@ const PROJECT_OWNER: &str = "PROJECT_OWNER";
 pub const METADATA_ORIGIN: &str = "origin";
 
 /// Metadata key on a service account of a subject-scoped grant holding the
-/// verified subject it was provisioned for. For auditing only: the account
-/// may be able to overwrite it (see `org_roles`), so zapp never acts on it.
+/// verified subject it was provisioned for. Never used to recognise or
+/// garbage collect accounts (an account with `org_roles` that write users may
+/// overwrite it); only checked, with `origin`, before adopting an account
+/// by name.
 pub const METADATA_SUBJECT: &str = "subject";
 
 /// Metadata key prefix `creator.<project id>` (value `1`) recording that the
@@ -359,6 +361,27 @@ impl ZitadelClient {
 		);
 		let user_id = user.user_id().cloned().context("Zitadel returned a user without id")?;
 
+		// An account can rename itself (UpdateMyUserName), so the name alone
+		// proves nothing: another issuer's or subject's account may have
+		// claimed it to be granted this one's roles.
+		// shortcut: an account whose creation succeeded but whose metadata
+		// write failed is refused too and must be deleted by hand.
+		let recorded = self.user_metadata(&user_id, org_id).await?;
+		//= docs/requirements/zapp.md#adopt-1
+		//# zapp MUST adopt an existing service account of the requested name
+		//# only if its recorded issuer equals the verified issuer and its
+		//# recorded subject equals the subject of a subject-scoped grant, or is
+		//# absent for a grant without subject pattern.
+
+		//= docs/requirements/zapp.md#adopt-1
+		//# Otherwise zapp MUST refuse the request without changing or granting
+		//# anything to that account.
+		anyhow::ensure!(
+			recorded.get(METADATA_ORIGIN).map(String::as_str) == Some(issuer)
+				&& recorded.get(METADATA_SUBJECT).map(String::as_str) == subject,
+			"service account {name} ({user_id}) exists but was not provisioned for this issuer and subject; refusing to take it over"
+		);
+
 		self.set_user_metadata(&user_id, org_id, &metadata).await?;
 		match user.state() {
 			Some(UserState::Inactive) => {
@@ -639,8 +662,8 @@ impl ZitadelClient {
 			}
 			let metadata = self.user_metadata(user_id, org_id).await?;
 			//= docs/requirements/zapp.md#audit-1
-			//# zapp MUST NOT use the recorded subject to recognise, adopt or
-			//# garbage collect service accounts.
+			//# zapp MUST NOT use the recorded subject to recognise or garbage
+			//# collect service accounts.
 			let Some(origin) = metadata.get(METADATA_ORIGIN) else { continue };
 			accounts.push(ManagedAccount {
 				user_id: user_id.clone(),
@@ -1077,12 +1100,102 @@ pub(crate) mod tests {
 
 		//= docs/requirements/zapp.md#audit-1
 		//= type=test
-		//# zapp MUST NOT use the recorded subject to recognise, adopt or
-		//# garbage collect service accounts.
+		//# zapp MUST NOT use the recorded subject to recognise or garbage
+		//# collect service accounts.
 		let accounts = client.list_managed_accounts(ORG_ID).await.expect("listing accounts");
 		let ids: Vec<_> = accounts.iter().map(|account| account.user_id.as_str()).collect();
 		assert_eq!(ids, ["2"]);
 		assert_eq!(accounts[0].project_ids, ["10"]);
+	}
+
+	/// Runs `ensure_service_account` for issuer `https://k8s.example.com` and
+	/// `subject` against a Zitadel where the name is already taken by a
+	/// machine user carrying `existing` metadata. `adopt` says whether zapp
+	/// may write to that account.
+	async fn adopt_existing(
+		subject: Option<&str>,
+		existing: &[(&str, &str)],
+		adopt: bool,
+	) -> anyhow::Result<String> {
+		let server = MockServer::start().await;
+		let client = test_client(&server).await;
+		let name = "zapp/k8s.example.com#system:serviceaccount:b:api";
+		Mock::given(method("POST"))
+			.and(path("/management/v1/users/machine"))
+			.respond_with(ResponseTemplate::new(409))
+			.mount(&server)
+			.await;
+		Mock::given(method("POST"))
+			.and(path("/v2/users"))
+			.respond_with(ResponseTemplate::new(200).set_body_json(json!({ "result": [{
+				"userId": USER_ID,
+				"username": name,
+				"state": "USER_STATE_ACTIVE",
+				"machine": { "name": name },
+			}] })))
+			.mount(&server)
+			.await;
+		let result: Vec<_> = existing
+			.iter()
+			.map(|(key, value)| json!({ "key": key, "value": BASE64_STANDARD.encode(value) }))
+			.collect();
+		Mock::given(method("POST"))
+			.and(path(format!("/management/v1/users/{USER_ID}/metadata/_search")))
+			.respond_with(ResponseTemplate::new(200).set_body_json(json!({ "result": result })))
+			.mount(&server)
+			.await;
+		Mock::given(method("POST"))
+			.and(path(format!("/management/v1/users/{USER_ID}/metadata/_bulk")))
+			.respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+			.expect(u64::from(adopt))
+			.mount(&server)
+			.await;
+		client.ensure_service_account(name, "https://k8s.example.com", subject, ORG_ID, "10").await
+	}
+
+	#[tokio::test]
+	async fn refuses_to_adopt_a_foreign_account_of_the_same_name() {
+		let subject = Some("system:serviceaccount:b:api");
+		//= docs/requirements/zapp.md#adopt-1
+		//= type=test
+		//# Otherwise zapp MUST refuse the request without changing or granting
+		//# anything to that account.
+		for existing in [
+			// Another subject's account, renamed to this one's name.
+			&[("origin", "https://k8s.example.com"), ("subject", "system:serviceaccount:a:api")][..],
+			// Another issuer's account.
+			&[("origin", "https://other.example.com"), ("subject", "system:serviceaccount:b:api")],
+			// The account of a grant without subject pattern.
+			&[("origin", "https://k8s.example.com")],
+			// Not zapp's at all.
+			&[],
+		] {
+			let err = adopt_existing(subject, existing, false).await.expect_err("refused");
+			assert!(err.to_string().contains("not provisioned for"), "{existing:?}: {err}");
+		}
+		let existing = [("origin", "https://k8s.example.com"), ("subject", "x")];
+		assert!(adopt_existing(None, &existing, false).await.is_err());
+	}
+
+	#[tokio::test]
+	async fn adopts_its_own_account() {
+		//= docs/requirements/zapp.md#adopt-1
+		//= type=test
+		//# zapp MUST adopt an existing service account of the requested name
+		//# only if its recorded issuer equals the verified issuer and its
+		//# recorded subject equals the subject of a subject-scoped grant, or is
+		//# absent for a grant without subject pattern.
+		let existing = [
+			("origin", "https://k8s.example.com"),
+			("subject", "system:serviceaccount:b:api"),
+			("creator.10", "1"),
+		];
+		let user_id = adopt_existing(Some("system:serviceaccount:b:api"), &existing, true)
+			.await
+			.expect("adopted");
+		assert_eq!(user_id, USER_ID);
+		let existing = [("origin", "https://k8s.example.com"), ("creator.10", "1")];
+		adopt_existing(None, &existing, true).await.expect("adopted");
 	}
 
 	/// Provisions with org roles against a Zitadel that expects the account

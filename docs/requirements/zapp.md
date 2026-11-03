@@ -82,7 +82,15 @@ zapp MUST refuse to start if the configured CA bundle cannot be read or contains
 
 zapp MUST record the verified issuer in the metadata of the service account, and for a subject-scoped grant also the verified subject.
 
-zapp MUST NOT use the recorded subject to recognise, adopt or garbage collect service accounts.
+zapp MUST NOT use the recorded subject to recognise or garbage collect service accounts.
+
+### ADOPT-1
+
+A service account of the requested name can already exist, and an account can rename itself, so the name alone does not identify it.
+
+zapp MUST adopt an existing service account of the requested name only if its recorded issuer equals the verified issuer and its recorded subject equals the subject of a subject-scoped grant, or is absent for a grant without subject pattern.
+
+Otherwise zapp MUST refuse the request without changing or granting anything to that account.
 
 ### HOME-ORG-1
 
