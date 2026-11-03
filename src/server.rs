@@ -515,7 +515,8 @@ mod tests {
 		//= docs/requirements/zapp.md#verify-1
 		//= type=test
 		//# zapp MUST NOT send any request to the issuer of a token unless the
-		//# issuer claimed by the token matches the issuer pattern of some grant.
+		//# issuer claimed by the token matches the issuer pattern of some
+		//# grant.
 		let (status, body) = request_credentials(&issuer.uri(), resolver).await;
 		assert_eq!(status, StatusCode::FORBIDDEN);
 		assert_eq!(body["error"], "issuer_not_entitled");

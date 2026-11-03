@@ -136,17 +136,15 @@ Every step is optimistic and converges under concurrent requests:
    project of that name is looked up and reactivated if needed.
 1. **Create the service account** of the same name and set metadata on it:
    `origin = <issuer>` marks it as zapp-managed, `subject = <subject>` (only for
-   subject-scoped grants),
-   `creator.<project id> = 1` records the project it was provisioned for (the ID
-   is in the key, so several can coexist). On `409 Conflict` the existing
-   account is adopted, but only if its `origin` and `subject` metadata match the
-   request (an account can rename itself, so another issuer's or subject's
-   account could have claimed the name); otherwise the request is refused and
-   nothing is granted. On adoption the metadata is added, it is reactivated or
-   unlocked, and
-   any _other_ project recorded in its `creator.*` keys is deleted, so an
-   account owns exactly one project. zapp refuses to adopt a human user of that
-   name.
+   subject-scoped grants), `creator.<project id> = 1` records the project it was
+   provisioned for (the ID is in the key, so several can coexist). On
+   `409 Conflict` the existing account is adopted, but only if its `origin` and
+   `subject` metadata match the request (an account can rename itself, so
+   another issuer's or subject's account could have claimed the name); otherwise
+   the request is refused and nothing is granted. On adoption the metadata is
+   added, it is reactivated or unlocked, and any _other_ project recorded in its
+   `creator.*` keys is deleted, so an account owns exactly one project. zapp
+   refuses to adopt a human user of that name.
 1. **Make it `PROJECT_OWNER`**. On `409 Conflict` (already a member) the role is
    restored if the account had dropped it.
 1. **Grant instance roles**, only if the grant sets `instance_roles`: the
@@ -175,8 +173,8 @@ but _not_ write its own metadata (`SetUserMetadata` needs `user.write`; the auth
 API has no metadata write at all). zapp therefore relies on nothing the account
 can change:
 
-- Accounts are recognised by `origin` metadata, not by name. An existing
-  account is adopted by name only if its `origin` and `subject` match.
+- Accounts are recognised by `origin` metadata, not by name. An existing account
+  is adopted by name only if its `origin` and `subject` match.
 - Projects are tracked by `creator.*` metadata, not by membership. A
   `PROJECT_OWNER` that removes its own membership does not exempt its project
   from cleanup; a project deleted by the account is simply found gone.
@@ -195,10 +193,10 @@ garbage collection. Two ways out:
   metadata stays out of its reach. zapp therefore refuses to start if a grant
   with `org_roles` names the home organisation as its `org_id`, or if any grant
   names an instance role that can write users in every organisation
-  (`IAM_OWNER`, `IAM_ORG_MANAGER`, `IAM_USER_MANAGER`, `IAM_LOGIN_CLIENT`). Accounts created
-  before a home organisation was configured stay in their grant's organisation
-  until garbage collection removes them; the next request creates a new pair in
-  the home organisation.
+  (`IAM_OWNER`, `IAM_ORG_MANAGER`, `IAM_USER_MANAGER`, `IAM_LOGIN_CLIENT`).
+  Accounts created before a home organisation was configured stay in their
+  grant's organisation until garbage collection removes them; the next request
+  creates a new pair in the home organisation.
 - Without a home organisation, only grant such roles in an organisation whose
   users and projects all belong to the party the account acts for (e.g. one
   tenant).
@@ -270,9 +268,9 @@ certificates are trusted for discovery, introspection and JWKS requests on top
 of the system roots. Set `verification.ca_hosts` to the issuer hostnames that
 need it (e.g. `["kubernetes.default.svc"]`): every other issuer is then verified
 against the system roots only. Without `ca_hosts` the CA is trusted for every
-issuer, and zapp logs a warning at startup. zapp fetches discovery and JWKS without credentials, so the
-API server must allow anonymous requests to them, e.g. by binding the
-`system:service-account-issuer-discovery` ClusterRole to
+issuer, and zapp logs a warning at startup. zapp fetches discovery and JWKS
+without credentials, so the API server must allow anonymous requests to them,
+e.g. by binding the `system:service-account-issuer-discovery` ClusterRole to
 `system:unauthenticated` (by default it is bound to service accounts only).
 
 Only a verified subject is used: from the claims of a token whose signature was
