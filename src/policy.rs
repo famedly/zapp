@@ -41,6 +41,10 @@ pub trait PermissionResolver: Send + Sync {
 		path: &str,
 		subject: Option<&str>,
 	) -> Option<Entitlement>;
+
+	/// Whether some entitlement could exist for the issuer, whatever the
+	/// subject. Asked before the issuer is contacted.
+	fn matches_issuer(&self, scheme: &str, domain: &str, port: Option<u16>, path: &str) -> bool;
 }
 
 /// Static resolver matching issuers against configured patterns, in order.
@@ -56,6 +60,10 @@ impl StaticResolver {
 }
 
 impl PermissionResolver for StaticResolver {
+	fn matches_issuer(&self, scheme: &str, domain: &str, port: Option<u16>, path: &str) -> bool {
+		self.grants.iter().any(|grant| pattern_matches(&grant.pattern, scheme, domain, port, path))
+	}
+
 	fn resolve(
 		&self,
 		scheme: &str,
@@ -197,6 +205,9 @@ mod tests {
 		assert!(resolve(None).is_none());
 		assert!(resolve(Some("")).is_none());
 		assert!(resolve(Some("anything")).is_some());
+		// Asked before the subject is known, so subject patterns do not count.
+		assert!(only_subject_grants.matches_issuer("https", "k8s.example.com", None, ""));
+		assert!(!only_subject_grants.matches_issuer("https", "other.example.com", None, ""));
 	}
 
 	#[test]

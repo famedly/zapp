@@ -17,7 +17,7 @@ use tracing::{info, warn};
 
 use crate::{
 	policy::PermissionResolver,
-	verify::{DomainVerifier, VerifyError},
+	verify::{DomainVerifier, VerifyError, parse_claims},
 	zitadel::{Credential, CredentialType, ZitadelClient},
 };
 
@@ -139,7 +139,16 @@ impl IntoResponse for ApiError {
 					VerifyError::TokenInactive(_) => "token_inactive",
 					_ => "verification_failed",
 				};
-				(StatusCode::UNAUTHORIZED, error, e.to_string())
+				let message = match error {
+					//= docs/requirements/zapp.md#verify-1
+					//# zapp MUST NOT return to the client what went wrong in a
+					//# request to the issuer.
+					"verification_failed" => {
+						"the token could not be verified with its issuer".to_string()
+					}
+					_ => e.to_string(),
+				};
+				(StatusCode::UNAUTHORIZED, error, message)
 			}
 			ApiError::NotEntitled(issuer) => (
 				StatusCode::FORBIDDEN,
@@ -177,6 +186,16 @@ async fn issue_credentials(
 ) -> Result<Json<CredentialsResponse>, ApiError> {
 	let Query(query) = query.map_err(ApiError::BadQuery)?;
 	let token = bearer_token(&headers).ok_or(ApiError::MissingBearer)?;
+
+	// Unverified, so it only decides whether the issuer is worth asking.
+	let claimed = parse_claims(token).map_err(ApiError::Verify)?;
+	//= docs/requirements/zapp.md#verify-1
+	//# zapp MUST NOT send any request to the issuer of a token unless the
+	//# issuer claimed by the token matches the issuer pattern of some grant.
+	if !state.resolver.matches_issuer(&claimed.scheme, &claimed.domain, claimed.port, &claimed.path)
+	{
+		return Err(ApiError::NotEntitled(claimed.issuer_url()));
+	}
 
 	let claims = state.verifier.verify(token).await.map_err(|e| {
 		info!("issuer verification failed: {e}");
@@ -291,14 +310,19 @@ mod tests {
 		zitadel::tests::test_client,
 	};
 
-	/// Entitles every caller to org 1 with per-subject accounts and records
-	/// the subject it was asked about.
+	/// Entitles every caller (unless `refuse_issuers`) to org 1 with
+	/// per-subject accounts and records the subject it was asked about.
 	#[derive(Default)]
 	struct RecordingResolver {
 		subjects: Arc<Mutex<Vec<Option<String>>>>,
+		refuse_issuers: bool,
 	}
 
 	impl PermissionResolver for RecordingResolver {
+		fn matches_issuer(&self, _: &str, _: &str, _: Option<u16>, _: &str) -> bool {
+			!self.refuse_issuers
+		}
+
 		fn resolve(
 			&self,
 			_scheme: &str,
@@ -445,5 +469,76 @@ mod tests {
 		//= type=test
 		//# zapp MUST pass the verified subject to the permission resolver.
 		assert_eq!(*subjects.lock().unwrap(), [Some(subject.to_string())]);
+	}
+
+	/// Sends an unsigned token for issuer `iss` to a zapp whose Zitadel is
+	/// a bare mock, and returns the status and the JSON body.
+	async fn request_credentials(
+		iss: &str,
+		resolver: RecordingResolver,
+	) -> (StatusCode, serde_json::Value) {
+		let zitadel = MockServer::start().await;
+		let state = Arc::new(AppState {
+			verifier: DomainVerifier::new(&VerificationConfig::default(), true).unwrap(),
+			resolver: Box::new(resolver),
+			zitadel: Arc::new(test_client(&zitadel).await),
+			account_prefix_https: "zapp/".to_string(),
+			account_prefix_http: Some("zapp-insecure/".to_string()),
+		});
+		let payload = json!({ "iss": iss, "aud": "zapp" });
+		let token = format!(
+			"{}.{}.signature",
+			URL_SAFE_NO_PAD.encode(r#"{"alg":"RS256","typ":"JWT"}"#),
+			URL_SAFE_NO_PAD.encode(payload.to_string())
+		);
+		let request = axum::http::Request::post("/v1/credentials")
+			.header(header::AUTHORIZATION, format!("Bearer {token}"))
+			.body(Body::empty())
+			.unwrap();
+		let response = router(state).oneshot(request).await.unwrap();
+		let status = response.status();
+		let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+		(status, serde_json::from_slice(&body).unwrap())
+	}
+
+	#[tokio::test]
+	async fn does_not_contact_issuers_without_a_grant() {
+		let issuer = MockServer::start().await;
+		Mock::given(wiremock::matchers::any())
+			.respond_with(ResponseTemplate::new(500))
+			.expect(0)
+			.mount(&issuer)
+			.await;
+		let resolver = RecordingResolver { refuse_issuers: true, ..RecordingResolver::default() };
+		let subjects = resolver.subjects.clone();
+
+		//= docs/requirements/zapp.md#verify-1
+		//= type=test
+		//# zapp MUST NOT send any request to the issuer of a token unless the
+		//# issuer claimed by the token matches the issuer pattern of some grant.
+		let (status, body) = request_credentials(&issuer.uri(), resolver).await;
+		assert_eq!(status, StatusCode::FORBIDDEN);
+		assert_eq!(body["error"], "issuer_not_entitled");
+		assert!(subjects.lock().unwrap().is_empty());
+	}
+
+	#[tokio::test]
+	async fn hides_issuer_errors_from_clients() {
+		let issuer = MockServer::start().await;
+		Mock::given(method("GET"))
+			.and(path("/.well-known/openid-configuration"))
+			.respond_with(ResponseTemplate::new(503))
+			.expect(1)
+			.mount(&issuer)
+			.await;
+
+		//= docs/requirements/zapp.md#verify-1
+		//= type=test
+		//# zapp MUST NOT return to the client what went wrong in a request to
+		//# the issuer.
+		let (status, body) = request_credentials(&issuer.uri(), RecordingResolver::default()).await;
+		assert_eq!(status, StatusCode::UNAUTHORIZED);
+		assert_eq!(body["error"], "verification_failed");
+		assert_eq!(body["message"], "the token could not be verified with its issuer");
 	}
 }

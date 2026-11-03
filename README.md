@@ -91,7 +91,9 @@ Query `type` selects the credential:
 The JWT must carry an `iss` claim containing a full `https://` (or `http://` for
 testing) URL — bare domains are rejected, matching OpenID Connect, where `iss`
 is always a URL. The issuer must serve OpenID Connect discovery metadata with
-`introspection_endpoint` (preferred) or `jwks_uri`.
+`introspection_endpoint` (preferred) or `jwks_uri`. zapp contacts an issuer only
+if it matches some grant's pattern (`403 issuer_not_entitled` otherwise), and
+does not tell the client why a request to the issuer failed.
 
 Response `200`:
 

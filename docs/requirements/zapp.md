@@ -84,6 +84,12 @@ zapp MUST refuse to start if the configured CA bundle cannot be read or contains
 
 zapp MUST refuse to start if CA hosts are configured without a CA bundle or a CA host is not a valid hostname.
 
+### VERIFY-1
+
+zapp MUST NOT send any request to the issuer of a token unless the issuer claimed by the token matches the issuer pattern of some grant.
+
+zapp MUST NOT return to the client what went wrong in a request to the issuer.
+
 ## Accounts
 
 ### AUDIT-1
