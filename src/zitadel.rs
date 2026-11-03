@@ -937,10 +937,8 @@ pub(crate) mod tests {
 
 		let key = KeyPair::generate(KeySize::Rsa2048).expect("generating RSA key");
 		let der = AsDer::<Pkcs8V1Der>::as_der(&key).expect("encoding key");
-		let pem = format!(
-			"-----BEGIN PRIVATE KEY-----\n{}\n-----END PRIVATE KEY-----\n",
-			BASE64_STANDARD.encode(der.as_ref())
-		);
+		let pem =
+			rcgen::KeyPair::try_from(der.as_ref()).expect("importing the key").serialize_pem();
 		let key_file = std::env::temp_dir().join(format!(
 			"zapp-test-key-{}-{}.json",
 			std::process::id(),

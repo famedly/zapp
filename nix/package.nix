@@ -28,6 +28,10 @@
           # the binary contains the correct commit hash to fulfill AGPL requirements
           env.GIT_COMMIT_HASH = inputs.self.rev;
 
+          # the tests build HTTP clients, which load the system's trusted roots;
+          # the build sandbox has none
+          env.SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
+
           meta = {
             description = "Zitadel Automatic Project Provisioner";
             mainProgram = "zapp";
