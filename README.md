@@ -191,7 +191,9 @@ garbage collection. Two ways out:
   members from other organisations). An account can write the users of the
   organisation it acts on, but not those of the home organisation, so zapp's
   metadata stays out of its reach. zapp therefore refuses to start if a grant
-  with `org_roles` names the home organisation as its `org_id`. Accounts created
+  with `org_roles` names the home organisation as its `org_id`, or if any grant
+  names an instance role that can write users in every organisation
+  (`IAM_OWNER`, `IAM_ORG_MANAGER`, `IAM_USER_MANAGER`, `IAM_LOGIN_CLIENT`). Accounts created
   before a home organisation was configured stay in their grant's organisation
   until garbage collection removes them; the next request creates a new pair in
   the home organisation.

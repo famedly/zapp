@@ -8,6 +8,11 @@ use anyhow::Context;
 use serde::Deserialize;
 use url::Url;
 
+/// Instance roles that hold `user.write` (Zitadel's default role mapping),
+/// which includes writing user metadata in every organisation.
+const USER_WRITING_INSTANCE_ROLES: &[&str] =
+	&["IAM_OWNER", "IAM_ORG_MANAGER", "IAM_USER_MANAGER", "IAM_LOGIN_CLIENT"];
+
 #[derive(Debug, Deserialize)]
 pub struct Config {
 	/// Address to listen on, e.g. "0.0.0.0:8080".
@@ -278,6 +283,20 @@ impl Config {
 				//# roles and its organisation is the home organisation.
 				anyhow::bail!(
 					"grant pattern {:?} has org_roles on the home organisation zitadel.account_org_id: they would let the account reach zapp's metadata",
+					grant.pattern
+				);
+			}
+			if self.zitadel.account_org_id.is_some()
+				&& let Some(role) = grant
+					.instance_roles
+					.iter()
+					.find(|role| USER_WRITING_INSTANCE_ROLES.contains(&role.as_str()))
+			{
+				//= docs/requirements/zapp.md#home-org-1
+				//# zapp MUST refuse to start if a home organisation is configured
+				//# and a grant names an instance role that can write users.
+				anyhow::bail!(
+					"grant pattern {:?} has instance role {role:?}, which can write the users of the home organisation zitadel.account_org_id and thereby zapp's metadata",
 					grant.pattern
 				);
 			}
@@ -582,6 +601,26 @@ org_id = "123456789012345678"
 				) + "org_roles = [\"ORG_USER_MANAGER\"]\n"),
 			)
 		};
+		//= docs/requirements/zapp.md#home-org-1
+		//= type=test
+		//# zapp MUST refuse to start if a home organisation is configured and
+		//# a grant names an instance role that can write users.
+		let instance_role = |home: bool, role: &str| {
+			let toml = if home {
+				MINIMAL.replace(
+					"key_file = \"/run/secrets/zapp-key.json\"",
+					"key_file = \"/run/secrets/zapp-key.json\"\naccount_org_id = \"999\"",
+				)
+			} else {
+				MINIMAL.to_string()
+			};
+			parse(&(toml + &format!("instance_roles = [\"{role}\"]\n")))
+		};
+		for role in USER_WRITING_INSTANCE_ROLES {
+			assert!(instance_role(true, role).is_err(), "{role} with a home org");
+			assert!(instance_role(false, role).is_ok(), "{role} without a home org");
+		}
+		assert!(instance_role(true, "IAM_OWNER_VIEWER").is_ok());
 		assert!(roles_on("123456789012345678").is_err(), "org roles on the home org");
 		assert!(roles_on("999").is_ok());
 		assert!(with_home("123456789012345678").is_ok(), "home org without org roles");

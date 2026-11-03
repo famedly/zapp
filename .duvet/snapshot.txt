@@ -46,3 +46,4 @@ SPECIFICATION: [zapp requirements](docs/requirements/zapp.md)
     TEXT[!MUST,implementation,test]: If a home organisation is configured, garbage collection MUST include the home organisation.
     TEXT[!MUST,implementation,test]: zapp MUST refuse to start if the home organisation ID is not numeric.
     TEXT[!MUST,implementation,test]: zapp MUST refuse to start if a grant names organisation roles and its organisation is the home organisation.
+    TEXT[!MUST,implementation,test]: zapp MUST refuse to start if a home organisation is configured and a grant names an instance role that can write users.

@@ -105,3 +105,5 @@ If a home organisation is configured, garbage collection MUST include the home o
 zapp MUST refuse to start if the home organisation ID is not numeric.
 
 zapp MUST refuse to start if a grant names organisation roles and its organisation is the home organisation.
+
+zapp MUST refuse to start if a home organisation is configured and a grant names an instance role that can write users.
