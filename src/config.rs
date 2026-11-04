@@ -13,7 +13,14 @@ use url::Url;
 const USER_WRITING_INSTANCE_ROLES: &[&str] =
 	&["IAM_OWNER", "IAM_ORG_MANAGER", "IAM_USER_MANAGER", "IAM_LOGIN_CLIENT"];
 
+/// Organisation roles that hold `user.write` (Zitadel's default role
+/// mapping), which includes writing user metadata in the organisation.
+const USER_WRITING_ORG_ROLES: &[&str] = &["ORG_OWNER", "ORG_USER_MANAGER"];
+
 #[derive(Debug, Deserialize)]
+// Unknown keys are errors, so a binary that does not know an option (e.g.
+// an older one) refuses the config instead of ignoring it.
+#[serde(deny_unknown_fields)]
 pub struct Config {
 	/// Address to listen on, e.g. "0.0.0.0:8080".
 	#[serde(default = "default_listen")]
@@ -31,6 +38,7 @@ pub struct Config {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ZitadelConfig {
 	/// Base URL of the Zitadel instance, e.g. "https://auth.example.com".
 	pub url: Url,
@@ -69,6 +77,7 @@ pub struct ZitadelConfig {
 /// `{issuer}/.well-known/openid-configuration` and then uses the advertised
 /// `introspection_endpoint` (preferred) or `jwks_uri`.
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct VerificationConfig {
 	/// Audience every token must carry, regardless of how it is verified.
 	/// Kubernetes: `kubectl create token <sa> --audience=<this>`.
@@ -107,6 +116,7 @@ impl Default for VerificationConfig {
 /// newest personal access token or machine key was created (or since the
 /// account was created, if it has none).
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GcConfig {
 	/// How often to run a collection pass, e.g. "10m".
 	#[serde(default = "default_gc_interval", with = "humantime_serde")]
@@ -124,6 +134,7 @@ pub struct GcConfig {
 /// A statically configured grant: issuers matching `pattern` are entitled to
 /// a service account and project in the given Zitadel organisation.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GrantConfig {
 	/// Full issuer pattern, e.g. "https://*.famedly.dev/**" or
 	/// "https://trusted.example.com/k8s". The scheme may be "*" for any
@@ -297,6 +308,20 @@ impl Config {
 					grant.pattern
 				);
 			}
+			if self.zitadel.account_org_id.is_none()
+				&& let Some(role) = grant
+					.org_roles
+					.iter()
+					.find(|role| USER_WRITING_ORG_ROLES.contains(&role.as_str()))
+			{
+				//= docs/requirements/zapp.md#org-roles-2
+				//# zapp MUST refuse to start if a grant names an organisation role
+				//# that can write users and no home organisation is configured.
+				anyhow::bail!(
+					"grant pattern {:?} has org role {role:?}, which can write the users of its organisation and thereby zapp's metadata there: set zitadel.account_org_id",
+					grant.pattern
+				);
+			}
 			if self.zitadel.account_org_id.is_some()
 				&& let Some(role) = grant
 					.instance_roles
@@ -332,9 +357,15 @@ impl Config {
 		)?;
 		if let Some(http_prefix) = &self.zitadel.account_prefix_http {
 			validate_account_prefix("zitadel.account_prefix_http", http_prefix)?;
-			if *http_prefix == self.zitadel.account_prefix_https {
+			let https_prefix = &self.zitadel.account_prefix_https;
+			if http_prefix.starts_with(https_prefix.as_str())
+				|| https_prefix.starts_with(http_prefix.as_str())
+			{
+				//= docs/requirements/zapp.md#subject-3
+				//# zapp MUST refuse to start if one account name prefix starts
+				//# with the other.
 				anyhow::bail!(
-					"zitadel.account_prefix_http must differ from zitadel.account_prefix_https: the prefix is the only place the issuer scheme is encoded in service account names"
+					"zitadel.account_prefix_http and zitadel.account_prefix_https must not start with one another: the prefix is the only place the issuer scheme is encoded in service account names, so an https and an http issuer could get the same name"
 				);
 			}
 		}
@@ -343,31 +374,25 @@ impl Config {
 }
 
 impl Config {
-	/// Organisations garbage collection scans: every grant's, plus the home
-	/// organisation if configured.
+	/// Organisations garbage collection scans: the home organisation if
+	/// configured, otherwise every grant's.
 	pub fn gc_org_ids(&self) -> std::collections::BTreeSet<String> {
-		//= docs/requirements/zapp.md#home-org-1
-		//# If a home organisation is configured, garbage collection MUST
-		//# include the home organisation.
-		self.grants
-			.iter()
-			.map(|grant| grant.org_id.clone())
-			.chain(self.zitadel.account_org_id.clone())
-			.collect()
+		match &self.zitadel.account_org_id {
+			//= docs/requirements/zapp.md#home-org-1
+			//# If a home organisation is configured, garbage collection MUST
+			//# scan only the home organisation.
+			Some(home) => [home.clone()].into(),
+			None => self.grants.iter().map(|grant| grant.org_id.clone()).collect(),
+		}
 	}
 }
 
 /// Service account names are "<prefix><host>[:<port>][/<path>]", followed
 /// by "#<subject>" for subject-scoped grants. The prefix must not contain '@'
-/// (Zitadel treats it as the login name separator), '#' (it separates the
-/// subject) or whitespace.
+/// (Zitadel treats it as the login name separator) or whitespace.
 fn validate_account_prefix(key: &str, prefix: &str) -> anyhow::Result<()> {
-	if prefix.is_empty()
-		|| prefix.contains('@')
-		|| prefix.contains('#')
-		|| prefix.chars().any(char::is_whitespace)
-	{
-		anyhow::bail!("{key} {prefix:?} must be non-empty and contain no '@', '#' or whitespace");
+	if prefix.is_empty() || prefix.contains('@') || prefix.chars().any(char::is_whitespace) {
+		anyhow::bail!("{key} {prefix:?} must be non-empty and contain no '@' or whitespace");
 	}
 	Ok(())
 }
@@ -464,17 +489,33 @@ org_id = "123456789012345678"
 	}
 
 	#[test]
-	fn http_prefix_must_differ() {
-		let toml = MINIMAL.replace(
-			"key_file = \"/run/secrets/zapp-key.json\"",
-			"key_file = \"/run/secrets/zapp-key.json\"\naccount_prefix_http = \"zapp/\"",
-		);
-		assert!(parse(&toml).is_err());
+	fn http_prefix_must_not_overlap() {
+		let prefixes = |https: &str, http: &str| {
+			parse(&MINIMAL.replace(
+				"key_file = \"/run/secrets/zapp-key.json\"",
+				&format!(
+					"key_file = \"/run/secrets/zapp-key.json\"\naccount_prefix_https = \"{https}\"\naccount_prefix_http = \"{http}\""
+				),
+			))
+		};
+		//= docs/requirements/zapp.md#subject-3
+		//= type=test
+		//# zapp MUST refuse to start if one account name prefix starts with
+		//# the other.
+		assert!(prefixes("zapp/", "zapp/").is_err());
+		// https://ab.example.com and http://b.example.com would both be
+		// "zapp/ab.example.com".
+		assert!(prefixes("zapp/", "zapp/a").is_err());
+		assert!(prefixes("zapp/a", "zapp/").is_err());
+		assert!(prefixes("zapp/", "zapp-insecure/").is_ok());
+		// '#' is fine: neither issuers nor encoded subjects contain it, so the
+		// last '#' still separates the subject.
+		assert!(prefixes("zapp#", "zapp-insecure#").is_ok());
 	}
 
 	#[test]
 	fn rejects_bad_prefixes() {
-		for prefix in ["", "za pp", "za@pp", "za#pp"] {
+		for prefix in ["", "za pp", "za@pp"] {
 			let toml = MINIMAL.replace(
 				"key_file = \"/run/secrets/zapp-key.json\"",
 				&format!(
@@ -521,9 +562,9 @@ org_id = "123456789012345678"
 
 	#[test]
 	fn org_roles_require_an_exact_issuer() {
-		let config = parse(&(MINIMAL.to_string() + "org_roles = [\"ORG_USER_MANAGER\"]\n"))
+		let config = parse(&(MINIMAL.to_string() + "org_roles = [\"ORG_OWNER_VIEWER\"]\n"))
 			.expect("valid config");
-		assert_eq!(config.grants[0].org_roles, ["ORG_USER_MANAGER"]);
+		assert_eq!(config.grants[0].org_roles, ["ORG_OWNER_VIEWER"]);
 		assert!(parse(MINIMAL).expect("valid config").grants[0].org_roles.is_empty());
 
 		//= docs/requirements/zapp.md#org-roles-2
@@ -532,7 +573,7 @@ org_id = "123456789012345678"
 		//# its issuer pattern contains a wildcard.
 		let wildcard = MINIMAL
 			.replace("https://trusted.example.com/k8s", "https://*.example.com/k8s")
-			+ "org_roles = [\"ORG_USER_MANAGER\"]\n";
+			+ "org_roles = [\"ORG_OWNER_VIEWER\"]\n";
 		assert!(parse(&wildcard).is_err(), "wildcard pattern with org roles");
 	}
 
@@ -581,12 +622,9 @@ org_id = "123456789012345678"
 		assert_eq!(config.zitadel.account_org_id.as_deref(), Some("999"));
 		//= docs/requirements/zapp.md#home-org-1
 		//= type=test
-		//# If a home organisation is configured, garbage collection MUST
-		//# include the home organisation.
-		assert_eq!(
-			config.gc_org_ids().into_iter().collect::<Vec<_>>(),
-			["123456789012345678", "999"]
-		);
+		//# If a home organisation is configured, garbage collection MUST scan
+		//# only the home organisation.
+		assert_eq!(config.gc_org_ids().into_iter().collect::<Vec<_>>(), ["999"]);
 		let without = parse(MINIMAL).expect("valid config");
 		assert_eq!(without.zitadel.account_org_id, None);
 		assert_eq!(without.gc_org_ids().into_iter().collect::<Vec<_>>(), ["123456789012345678"]);
@@ -634,7 +672,23 @@ org_id = "123456789012345678"
 		assert!(instance_role(true, "IAM_OWNER_VIEWER").is_ok());
 		assert!(roles_on("123456789012345678").is_err(), "org roles on the home org");
 		assert!(roles_on("999").is_ok());
+
+		//= docs/requirements/zapp.md#org-roles-2
+		//= type=test
+		//# zapp MUST refuse to start if a grant names an organisation role that
+		//# can write users and no home organisation is configured.
+		for role in USER_WRITING_ORG_ROLES {
+			let toml = MINIMAL.to_string() + &format!("org_roles = [\"{role}\"]\n");
+			assert!(parse(&toml).is_err(), "{role} without a home org");
+		}
 		assert!(with_home("123456789012345678").is_ok(), "home org without org roles");
+	}
+
+	#[test]
+	fn rejects_unknown_keys() {
+		// E.g. a grant option this binary does not know must not be dropped.
+		assert!(parse(&(MINIMAL.to_string() + "subjects = \"a:*\"\n")).is_err());
+		assert!(parse(&MINIMAL.replace("[zitadel]", "[zitadel]\naccount_org = \"1\"")).is_err());
 	}
 
 	#[test]

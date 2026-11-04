@@ -22,7 +22,7 @@ key_file = "/run/secrets/zapp-key.json"
 # similar) in the prefix if one is wanted.
 account_prefix_https = "zapp/"
 # Prefix for plain-http issuers. Optional: if unset (the default), http
-# issuers are rejected outright. Must differ from account_prefix_https, as
+# issuers are rejected outright. Neither prefix may start with the other, as
 # the prefix is the only place the scheme is encoded. Only for local testing.
 account_prefix_http = "zapp-insecure/"
 # Personal access token lifetime (humantime syntax, e.g. "30m", "12h",
@@ -30,12 +30,13 @@ account_prefix_http = "zapp-insecure/"
 default_duration = "24h"
 # Optional home organisation: when set, every service account and project
 # is created in this organisation, and org_roles are granted on the grant's
-# org_id to a member from here. Recommended with org_roles that can write
-# users (e.g. ORG_USER_MANAGER): such an account can then not touch zapp's
+# org_id to a member from here. Required for org_roles that can write users
+# (ORG_USER_MANAGER, ORG_OWNER): such an account can then not touch zapp's
 # metadata, which lives in the home organisation (so no grant with org_roles
 # may name it as org_id, and no grant may hold an instance role that writes
-# users, such as IAM_OWNER or IAM_USER_MANAGER). Unset: accounts and
-# projects live in the grant's org_id.
+# users, such as IAM_OWNER or IAM_USER_MANAGER). Garbage collection then
+# scans only this organisation. Unset: accounts and projects live in the
+# grant's org_id.
 # account_org_id = "999999999999999999"
 
 # zapp always fetches {issuer}/.well-known/openid-configuration from the
