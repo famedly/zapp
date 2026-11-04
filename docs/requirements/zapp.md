@@ -26,11 +26,17 @@ If the matching grant names organisation roles, zapp MUST make the service accou
 
 If the service account already is a member of that organisation, zapp MUST replace its roles there with the grant's organisation roles.
 
+zapp MUST record in the metadata of the service account the organisation in which it gives the account organisation roles.
+
+If the recorded organisation differs from the grant's organisation or the grant names no organisation roles, zapp MUST remove the service account's membership in the recorded organisation before issuing a credential.
+
 ### ORG-ROLES-2
 
 zapp MUST refuse to start if an organisation role of a grant does not start with `ORG_` or contains characters other than upper-case letters and underscores.
 
 zapp MUST refuse to start if a grant names organisation roles and its issuer pattern contains a wildcard.
+
+zapp MUST refuse to start if a grant names an organisation role that can write users and no home organisation is configured.
 
 ## Tenant identity
 
@@ -63,6 +69,8 @@ The name for a pair of issuer and subject MUST differ from the name for every ot
 In names, zapp MUST percent-encode every character of the subject other than lower-case letters, digits, colons, dots, underscores and hyphens, so that the subjects of any issuer give valid and distinct names.
 
 zapp MUST reject a subject if the resulting name would be longer than 200 characters.
+
+zapp MUST refuse to start if one account name prefix starts with the other.
 
 ### SUBJECT-4
 
@@ -106,6 +114,14 @@ zapp MUST adopt an existing service account of the requested name only if its re
 
 Otherwise zapp MUST refuse the request without changing or granting anything to that account.
 
+### ADOPT-2
+
+A project owner can rename its project, so a project's name does not identify it either.
+
+zapp MUST use the project the service account is recorded as creator of, if that project still exists, and otherwise create a project.
+
+zapp MUST NOT adopt an existing project by its name: if a project of the requested name exists that the service account is not recorded as creator of, zapp MUST refuse the request.
+
 ### HOME-ORG-1
 
 If no home organisation is configured, zapp MUST create the service account and the project in the grant's organisation.
@@ -114,7 +130,7 @@ If a home organisation is configured, zapp MUST create the service account and t
 
 If a home organisation is configured, zapp MUST give the service account its organisation roles on the grant's organisation.
 
-If a home organisation is configured, garbage collection MUST include the home organisation.
+If a home organisation is configured, garbage collection MUST scan only the home organisation.
 
 zapp MUST refuse to start if the home organisation ID is not numeric.
 

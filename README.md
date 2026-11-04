@@ -130,21 +130,24 @@ expire. Everything set up in the project survives.
 
 ### Provisioning
 
-Every step is optimistic and converges under concurrent requests:
+Every step is optimistic, so renewals converge on the same account and project
+(concurrent _first_ requests for a name may get a `502`; a retry succeeds):
 
-1. **Create the project** named after the issuer. On `409 Conflict` the existing
-   project of that name is looked up and reactivated if needed.
-1. **Create the service account** of the same name and set metadata on it:
+1. **Create the service account** named after the issuer and set metadata on it:
    `origin = <issuer>` marks it as zapp-managed, `subject = <subject>` (only for
-   subject-scoped grants), `creator.<project id> = 1` records the project it was
-   provisioned for (the ID is in the key, so several can coexist). On
-   `409 Conflict` the existing account is adopted, but only if its `origin` and
-   `subject` metadata match the request (an account can rename itself, so
-   another issuer's or subject's account could have claimed the name); otherwise
-   the request is refused and nothing is granted. On adoption the metadata is
-   added, it is reactivated or unlocked, and any _other_ project recorded in its
-   `creator.*` keys is deleted, so an account owns exactly one project. zapp
+   subject-scoped grants) records the subject. On `409 Conflict` the existing
+   account is adopted, but only if its `origin` and `subject` metadata match the
+   request (an account can rename itself, so another issuer's or subject's
+   account could have claimed the name); otherwise the request is refused and
+   nothing is granted. An adopted account is reactivated or unlocked. zapp
    refuses to adopt a human user of that name.
+1. **Find or create the project**: the first still existing project recorded in
+   the account's `creator.<project id> = 1` metadata (reactivated if needed),
+   else a new project of the same name, which is then recorded. Projects are
+   never adopted by name (a project owner can rename its project): if the name
+   is taken by a project the account did not create, the request is refused. Any
+   _other_ project recorded in its `creator.*` keys is deleted, so an account
+   owns exactly one project.
 1. **Make it `PROJECT_OWNER`**. On `409 Conflict` (already a member) the role is
    restored if the account had dropped it.
 1. **Grant instance roles**, only if the grant sets `instance_roles`: the
@@ -152,7 +155,10 @@ Every step is optimistic and converges under concurrent requests:
    `409 Conflict` its roles are overwritten).
 1. **Grant organisation roles**, only if the grant sets `org_roles`: the account
    becomes a member of the grant's organisation with exactly those roles (on
-   `409 Conflict` its roles there are overwritten).
+   `409 Conflict` its roles there are overwritten), recorded as
+   `org_member = <org id>` metadata. If the grant moved to another organisation
+   or dropped its `org_roles`, the membership in the recorded organisation is
+   removed first.
 1. **Issue the credential** with the grant's expiry.
 
 #### Trust model
@@ -165,9 +171,10 @@ issuer, never on a wildcard pattern. The same holds for organisation roles: they
 reach every user (or project) of the grant's organisation, so a wildcard issuer
 pattern, which can match issuers run by unrelated parties, may not carry them; a
 wildcard _subject_ pattern can (all subjects come from the one exact issuer).
-Removing either from a grant does not revoke memberships already granted; they
-go when garbage collection deletes the account, or by hand. Tested against
-Zitadel, `PROJECT_OWNER` alone lets the account rename itself
+Removing `instance_roles` from a grant does not revoke them (that would need
+`IAM_OWNER` for every zapp); they go when garbage collection deletes the
+account, or by hand. Organisation roles are revoked on the next request. Tested
+against Zitadel, `PROJECT_OWNER` alone lets the account rename itself
 (`UpdateMyUserName`), remove its own project membership and delete its project,
 but _not_ write its own metadata (`SetUserMetadata` needs `user.write`; the auth
 API has no metadata write at all). zapp therefore relies on nothing the account
@@ -179,35 +186,35 @@ can change:
   `PROJECT_OWNER` that removes its own membership does not exempt its project
   from cleanup; a project deleted by the account is simply found gone.
 
-This no longer holds for an account whose `org_roles` include writing users
-(`ORG_USER_MANAGER`, `ORG_OWNER`): it can write the metadata of every user in
-its organisation, its own included, and thereby make zapp remove any project of
-that organisation (by recording it as `creator.*`) or adopt other accounts into
-garbage collection. Two ways out:
+This would not hold for an account whose `org_roles` include writing users
+(`ORG_USER_MANAGER`, `ORG_OWNER`) in the organisation it lives in: it could
+write the metadata of every user there, its own included, and thereby make zapp
+remove or hand it any project of that organisation (by recording it as
+`creator.*`) or adopt other accounts. Such roles therefore need a **home
+organisation** `zitadel.account_org_id`: every service account and project is
+then created there, and `org_roles` are granted on the grant's organisation to a
+member from the home organisation (Zitadel accepts org members from other
+organisations). An account can write the users of the organisation it acts on,
+but not those of the home organisation, so zapp's metadata stays out of its
+reach. zapp refuses to start if a grant names `ORG_USER_MANAGER` or `ORG_OWNER`
+without a home organisation, if a grant with `org_roles` names the home
+organisation as its `org_id`, or if a home organisation is set and any grant
+names an instance role that can write users in every organisation (`IAM_OWNER`,
+`IAM_ORG_MANAGER`, `IAM_USER_MANAGER`, `IAM_LOGIN_CLIENT`).
 
-- Set `zitadel.account_org_id` to a **home organisation**: every service account
-  and project is then created there, and `org_roles` are granted on the grant's
-  organisation to a member from the home organisation (Zitadel accepts org
-  members from other organisations). An account can write the users of the
-  organisation it acts on, but not those of the home organisation, so zapp's
-  metadata stays out of its reach. zapp therefore refuses to start if a grant
-  with `org_roles` names the home organisation as its `org_id`, or if any grant
-  names an instance role that can write users in every organisation
-  (`IAM_OWNER`, `IAM_ORG_MANAGER`, `IAM_USER_MANAGER`, `IAM_LOGIN_CLIENT`).
-  Accounts created before a home organisation was configured stay in their
-  grant's organisation until garbage collection removes them; the next request
-  creates a new pair in the home organisation.
-- Without a home organisation, only grant such roles in an organisation whose
-  users and projects all belong to the party the account acts for (e.g. one
-  tenant).
+Usernames are unique across the Zitadel instance (unless organisations enforce
+their domains), so accounts zapp created elsewhere before a home organisation
+was configured, or in a former home organisation, block their names: delete them
+(and their projects) by hand when setting or changing `zitadel.account_org_id`.
+Garbage collection only scans the current home organisation.
 
 ### Garbage collection
 
 An issuer that stops renewing is presumed gone. With a `[gc]` section, zapp
-periodically scans every organisation named by a grant for machine users
-carrying `origin` metadata and judges their age by the creation time of their
-newest personal access token or machine key (or of the account itself, if it has
-none):
+periodically scans the home organisation (or, without one, every organisation
+named by a grant) for machine users carrying `origin` metadata and judges their
+age by the creation time of their newest personal access token or machine key
+(or of the account itself, if it has none):
 
 - **soft** (`gc.soft`, e.g. `24h`): the service account is deactivated, then
   every project recorded in its `creator.*` metadata. Deactivated resources are
@@ -238,6 +245,11 @@ Zitadel organisation (`org_id`) to provision in and may set a token `duration`
 A grant for an exact issuer may also set `instance_roles` (e.g.
 `["IAM_OWNER_VIEWER"]`) and `org_roles` (e.g. `["ORG_USER_MANAGER"]`, roles
 starting with `ORG_`), see the trust model above.
+
+Unknown keys are refused at startup, so a mistyped option is not silently
+ignored. Older versions do ignore unknown keys, though: an older zapp reading a
+grant with `subject` matches it on the issuer alone. Roll out the new version
+everywhere before adding `subject` to grants.
 
 ### Subject-scoped grants
 
@@ -292,9 +304,9 @@ issuer URL with `<scheme>://` replaced verbatim by a prefix — used for both th
 service account and its project:
 
 - The prefix is `zitadel.account_prefix_https` for https issuers (default
-  `zapp/`) and `zitadel.account_prefix_http` for http issuers. They must differ
-  (the prefix is the only place the scheme is encoded), and the http prefix is
-  optional — leaving it unset rejects http issuers entirely.
+  `zapp/`) and `zitadel.account_prefix_http` for http issuers. Neither may start
+  with the other (the prefix is the only place the scheme is encoded), and the
+  http prefix is optional — leaving it unset rejects http issuers entirely.
 - No separator is inserted between prefix and host: include a trailing `/` (or
   whatever separator is wanted) in the prefix itself.
 - Non-default ports are kept; default ports are omitted even when the issuer URL
@@ -308,10 +320,9 @@ For a subject-scoped grant, `#<subject>` is appended:
 `zapp/k8s.example.com#system:serviceaccount:tenant-a:admin-api`. Every byte of
 the subject outside `a-z`, `0-9`, `:`, `.`, `_`, `-` is percent-encoded
 (`Auth0|x` → `%41uth0%7cx`), so names stay unambiguous and subjects differing
-only in case get distinct accounts. Prefixes may not contain `#`. A subject
-whose name would exceed 200 characters (Zitadel's limit) is rejected with
-`403 subject_not_usable`. Garbage collection handles these accounts like any
-other: each is collected on its own.
+only in case get distinct accounts. A subject whose name would exceed 200
+characters (Zitadel's limit) is rejected with `403 subject_not_usable`. Garbage
+collection handles these accounts like any other: each is collected on its own.
 
 ## Mock client
 

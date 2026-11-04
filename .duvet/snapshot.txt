@@ -2,10 +2,13 @@ SPECIFICATION: [zapp requirements](docs/requirements/zapp.md)
   SECTION: [ORG-ROLES-1](#org-roles-1)
     TEXT[!MUST,implementation,test]: If the matching grant names organisation roles, zapp MUST make the service account a member of the grant's organisation with exactly these roles.
     TEXT[!MUST,implementation,test]: If the service account already is a member of that organisation, zapp MUST replace its roles there with the grant's organisation roles.
+    TEXT[!MUST,implementation,test]: zapp MUST record in the metadata of the service account the organisation in which it gives the account organisation roles.
+    TEXT[!MUST,implementation,test]: If the recorded organisation differs from the grant's organisation or the grant names no organisation roles, zapp MUST remove the service account's membership in the recorded organisation before issuing a credential.
 
   SECTION: [ORG-ROLES-2](#org-roles-2)
     TEXT[!MUST,implementation,test]: zapp MUST refuse to start if an organisation role of a grant does not start with `ORG_` or contains characters other than upper-case letters and underscores.
     TEXT[!MUST,implementation,test]: zapp MUST refuse to start if a grant names organisation roles and its issuer pattern contains a wildcard.
+    TEXT[!MUST,implementation,test]: zapp MUST refuse to start if a grant names an organisation role that can write users and no home organisation is configured.
 
   SECTION: [SUBJECT-1](#subject-1)
     TEXT[!MUST,implementation,test]: A grant with a subject pattern MUST match a token only if the verified subject of the token matches the subject pattern.
@@ -23,6 +26,7 @@ SPECIFICATION: [zapp requirements](docs/requirements/zapp.md)
     TEXT[!MUST,implementation,test]: The name for a pair of issuer and subject MUST differ from the name for every other issuer and from the name for every other pair of issuer and subject.
     TEXT[!MUST,implementation,test]: In names, zapp MUST percent-encode every character of the subject other than lower-case letters, digits, colons, dots, underscores and hyphens, so that the subjects of any issuer give valid and distinct names.
     TEXT[!MUST,implementation,test]: zapp MUST reject a subject if the resulting name would be longer than 200 characters.
+    TEXT[!MUST,implementation,test]: zapp MUST refuse to start if one account name prefix starts with the other.
 
   SECTION: [SUBJECT-4](#subject-4)
     TEXT[!MUST,implementation,test]: zapp MUST pass the verified subject to the permission resolver.
@@ -46,11 +50,15 @@ SPECIFICATION: [zapp requirements](docs/requirements/zapp.md)
     TEXT[!MUST,implementation,test]: zapp MUST adopt an existing service account of the requested name only if its recorded issuer equals the verified issuer and its recorded subject equals the subject of a subject-scoped grant, or is absent for a grant without subject pattern.
     TEXT[!MUST,implementation,test]: Otherwise zapp MUST refuse the request without changing or granting anything to that account.
 
+  SECTION: [ADOPT-2](#adopt-2)
+    TEXT[!MUST,implementation,test]: zapp MUST use the project the service account is recorded as creator of, if that project still exists, and otherwise create a project.
+    TEXT[!MUST,implementation,test]: zapp MUST NOT adopt an existing project by its name: if a project of the requested name exists that the service account is not recorded as creator of, zapp MUST refuse the request.
+
   SECTION: [HOME-ORG-1](#home-org-1)
     TEXT[!MUST,implementation,test]: If no home organisation is configured, zapp MUST create the service account and the project in the grant's organisation.
     TEXT[!MUST,implementation,test]: If a home organisation is configured, zapp MUST create the service account and the project in the home organisation instead of the grant's organisation.
     TEXT[!MUST,implementation,test]: If a home organisation is configured, zapp MUST give the service account its organisation roles on the grant's organisation.
-    TEXT[!MUST,implementation,test]: If a home organisation is configured, garbage collection MUST include the home organisation.
+    TEXT[!MUST,implementation,test]: If a home organisation is configured, garbage collection MUST scan only the home organisation.
     TEXT[!MUST,implementation,test]: zapp MUST refuse to start if the home organisation ID is not numeric.
     TEXT[!MUST,implementation,test]: zapp MUST refuse to start if a grant names organisation roles and its organisation is the home organisation.
     TEXT[!MUST,implementation,test]: zapp MUST refuse to start if a home organisation is configured and a grant names an instance role that can write users.
