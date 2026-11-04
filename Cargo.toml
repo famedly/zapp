@@ -15,10 +15,9 @@ anyhow = "1"
 axum = { version = "0.8.9", features = ["query"] }
 base64 = "0.22"
 famedly-zitadel-rust-client = "0.14"
-futures = "0.3"
 humantime = "2"
 humantime-serde = "1"
-jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs"] }
+jsonwebtoken = { version = "11", default-features = false, features = ["aws_lc_rs", "use_pem"] }
 reqwest = { version = "0.13.4", features = ["json", "query", "form"] }
 reqwest-middleware = "0.5"
 serde = { version = "1", features = ["derive"] }

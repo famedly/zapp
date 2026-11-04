@@ -2,20 +2,22 @@
 //
 // SPDX-License-Identifier: AGPL-3.0-or-later
 
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+	collections::BTreeMap,
+	path::Path,
+	time::{Duration, Instant},
+};
 
 use anyhow::Context as _;
 use base64::{Engine as _, prelude::BASE64_STANDARD};
 use famedly_zitadel_rust_client::v2::{
-	HEADER_ZITADEL_ORGANIZATION_ID, Zitadel,
-	authentication::Token,
+	HEADER_ZITADEL_ORGANIZATION_ID,
 	management::{V1GetProjectByIdResponse, V1Project, V1ProjectState},
 	users::{
 		OrganizationIdQuery, SearchQuery, TextQueryMethod, TypeQuery, User, UserNameQuery,
 		UserState, Userv2Type,
 	},
 };
-use futures::TryStreamExt as _;
 use reqwest::{Method, StatusCode};
 use reqwest_middleware::ClientWithMiddleware;
 use serde::{
@@ -24,7 +26,7 @@ use serde::{
 };
 use serde_json::json;
 use time::{OffsetDateTime, format_description::well_known::Rfc3339};
-use tracing::info;
+use tracing::{debug, info};
 use url::Url;
 
 use crate::{config::ZitadelConfig, policy::Entitlement};
@@ -51,6 +53,55 @@ pub const METADATA_ORG_MEMBER: &str = "org_member";
 /// Metadata key prefix `creator.<project id>` (value `1`) recording that the
 /// service account was provisioned as creator of that project.
 pub const METADATA_CREATOR_PREFIX: &str = "creator.";
+
+/// The service user key zapp signs its token requests with (Zitadel's JSON
+/// key file).
+struct ServiceUserKey {
+	key_id: String,
+	user_id: String,
+	key: jsonwebtoken::EncodingKey,
+	/// The Zitadel base URL without trailing slash.
+	audience: String,
+}
+
+impl ServiceUserKey {
+	fn load(url: &Url, key_file: &Path) -> anyhow::Result<Self> {
+		#[derive(Deserialize)]
+		struct KeyFile {
+			#[serde(rename = "keyId")]
+			key_id: String,
+			#[serde(rename = "userId")]
+			user_id: String,
+			key: String,
+		}
+		let context = || format!("loading Zitadel key file {}", key_file.display());
+		let file: KeyFile =
+			serde_json::from_str(&std::fs::read_to_string(key_file).with_context(context)?)
+				.with_context(context)?;
+		Ok(Self {
+			key: jsonwebtoken::EncodingKey::from_rsa_pem(file.key.as_bytes())
+				.with_context(context)?,
+			key_id: file.key_id,
+			user_id: file.user_id,
+			audience: url.as_str().trim_end_matches('/').to_string(),
+		})
+	}
+
+	/// A JWT asserting the service user's identity, valid for a minute.
+	fn assertion(&self) -> anyhow::Result<String> {
+		let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+		header.kid = Some(self.key_id.clone());
+		let now = OffsetDateTime::now_utc().unix_timestamp();
+		let claims = json!({
+			"iss": self.user_id,
+			"sub": self.user_id,
+			"aud": self.audience,
+			"iat": now,
+			"exp": now + 60,
+		});
+		jsonwebtoken::encode(&header, &claims, &self.key).context("signing the token request")
+	}
+}
 
 /// Page size for management API list calls.
 const PAGE_SIZE: usize = 100;
@@ -183,13 +234,29 @@ fn creator_project_ids(metadata: &BTreeMap<String, String>) -> Vec<String> {
 		.collect()
 }
 
+/// Scopes of zapp's access token: Zitadel's APIs as audience.
+const TOKEN_SCOPE: &str = "openid urn:zitadel:iam:org:project:id:zitadel:aud";
+
+/// Renew the access token this long before it expires.
+const TOKEN_RENEWAL_MARGIN: Duration = Duration::from_secs(60);
+
+/// zapp's access token for Zitadel, obtained with a JWT signed by the service
+/// user key and reused until shortly before it expires.
+///
+/// Not the client library's `Token`, which takes `expires_in` (seconds) for
+/// a Unix timestamp, so it fetches a new token for every request; with
+/// Zitadel's token endpoint taking seconds per call, provisioning a single
+/// account then outlasts any client timeout.
+struct AccessToken {
+	key: ServiceUserKey,
+	cached: Option<(String, Instant)>,
+}
+
 /// Zitadel client provisioning service accounts and the projects they own.
 pub struct ZitadelClient {
-	zitadel: Zitadel,
-	/// Separate token holder for the requests made without the client
-	/// library (which hides HTTP status codes zapp needs to react to); it
-	/// authenticates with the same service user key.
-	token: Arc<Token>,
+	/// Locked across a renewal so concurrent requests wait for one token
+	/// instead of each fetching their own; bounded by the HTTP timeout.
+	token: tokio::sync::Mutex<AccessToken>,
 	http: ClientWithMiddleware,
 	url: Url,
 	/// Home organisation of all service accounts and projects, if configured.
@@ -204,19 +271,60 @@ impl ZitadelClient {
 			reqwest::Client::builder().timeout(Duration::from_secs(30)).build()?,
 		)
 		.build();
-		let zitadel = Zitadel::new(http.clone(), config.url.clone(), config.key_file.clone(), None)
-			.await
-			.with_context(|| format!("authenticating against Zitadel at {}", config.url))?;
-		let token = Token::new(config.url.clone(), &config.key_file, http.clone(), None, None)
-			.await
-			.with_context(|| format!("authenticating against Zitadel at {}", config.url))?;
-		Ok(Self {
-			zitadel,
-			token: Arc::new(token),
+		let client = Self {
+			token: tokio::sync::Mutex::new(AccessToken {
+				key: ServiceUserKey::load(&config.url, &config.key_file)?,
+				cached: None,
+			}),
 			http,
 			url: config.url.clone(),
 			account_org_id: config.account_org_id.clone(),
-		})
+		};
+		client
+			.access_token()
+			.await
+			.with_context(|| format!("authenticating against Zitadel at {}", config.url))?;
+		Ok(client)
+	}
+
+	/// The cached access token, renewed first if it (nearly) expired.
+	async fn access_token(&self) -> anyhow::Result<String> {
+		let mut token = self.token.lock().await;
+		if let Some((value, expires)) = &token.cached
+			&& Instant::now() + TOKEN_RENEWAL_MARGIN < *expires
+		{
+			return Ok(value.clone());
+		}
+
+		#[derive(Deserialize)]
+		struct Issued {
+			access_token: String,
+			expires_in: u64,
+		}
+		let assertion = token.key.assertion()?;
+		let response = self
+			.http
+			.post(self.url.join("oauth/v2/token")?)
+			.form(&[
+				("grant_type", "urn:ietf:params:oauth:grant-type:jwt-bearer"),
+				("scope", TOKEN_SCOPE),
+				("assertion", assertion.as_str()),
+			])
+			.send()
+			.await
+			.context("requesting a Zitadel access token")?;
+		let status = response.status();
+		let text = response.text().await.context("requesting a Zitadel access token")?;
+		if !status.is_success() {
+			return Err(anyhow::Error::from(HttpError { status, body: text })
+				.context("requesting a Zitadel access token"));
+		}
+		let issued: Issued =
+			serde_json::from_str(&text).context("parsing the Zitadel access token response")?;
+		debug!("obtained a Zitadel access token valid for {}s", issued.expires_in);
+		let expires = Instant::now() + Duration::from_secs(issued.expires_in);
+		token.cached = Some((issued.access_token.clone(), expires));
+		Ok(issued.access_token)
 	}
 
 	/// Base URL of the Zitadel instance the credentials are valid for.
@@ -449,14 +557,11 @@ impl ZitadelClient {
 
 		match user.state() {
 			Some(UserState::Inactive) => {
-				self.zitadel
-					.reactivate_user(&user_id)
-					.await
-					.context("reactivating service account")?;
+				self.user_action(&user_id, "reactivate").await?;
 				info!("reactivated service account {name} ({user_id})");
 			}
 			Some(UserState::Locked) => {
-				self.zitadel.unlock_user(&user_id).await.context("unlocking service account")?;
+				self.user_action(&user_id, "unlock").await?;
 				info!("unlocked service account {name} ({user_id})");
 			}
 			_ => {}
@@ -629,10 +734,7 @@ impl ZitadelClient {
 				.with_organization_id_query(OrganizationIdQuery::new(org_id.to_string())),
 		];
 		let users: Vec<User> = self
-			.zitadel
-			.list_users(Some(org_id.to_string()), None, None, Some(queries))
-			.context("searching existing service accounts")?
-			.try_collect()
+			.list_paged("v2/users", org_id, &queries)
 			.await
 			.context("searching existing service accounts")?;
 		Ok(users.into_iter().find(|user| user.username().map(String::as_str) == Some(name)))
@@ -704,10 +806,7 @@ impl ZitadelClient {
 				.with_organization_id_query(OrganizationIdQuery::new(org_id.to_string())),
 		];
 		let users: Vec<User> = self
-			.zitadel
-			.list_users(Some(org_id.to_string()), None, None, Some(queries))
-			.context("listing service accounts")?
-			.try_collect()
+			.list_paged("v2/users", org_id, &queries)
 			.await
 			.context("listing service accounts")?;
 
@@ -745,11 +844,19 @@ impl ZitadelClient {
 		user_id: &str,
 	) -> anyhow::Result<Option<OffsetDateTime>> {
 		let pats: Vec<Dated> = self
-			.list_paged(&format!("users/{user_id}/pats/_search"), org_id)
+			.list_paged::<_, ()>(
+				&format!("management/v1/users/{user_id}/pats/_search"),
+				org_id,
+				&[],
+			)
 			.await
 			.context("listing personal access tokens")?;
 		let keys: Vec<Dated> = self
-			.list_paged(&format!("users/{user_id}/keys/_search"), org_id)
+			.list_paged::<_, ()>(
+				&format!("management/v1/users/{user_id}/keys/_search"),
+				org_id,
+				&[],
+			)
 			.await
 			.context("listing machine keys")?;
 		Ok(pats
@@ -832,18 +939,27 @@ impl ZitadelClient {
 	}
 
 	pub async fn deactivate_user(&self, user_id: &str) -> anyhow::Result<()> {
-		self.zitadel
-			.deactivate_user(user_id)
-			.await
-			.with_context(|| format!("deactivating service account {user_id}"))?;
-		Ok(())
+		self.user_action(user_id, "deactivate").await
 	}
 
 	pub async fn delete_user(&self, user_id: &str) -> anyhow::Result<()> {
-		self.zitadel
-			.delete_user(user_id)
+		self.request::<IgnoredAny>(Method::DELETE, &format!("v2/users/{user_id}"), None, None)
 			.await
 			.with_context(|| format!("deleting service account {user_id}"))?;
+		Ok(())
+	}
+
+	/// Changes the state of a user with the user service v2, e.g.
+	/// `reactivate`.
+	async fn user_action(&self, user_id: &str, action: &str) -> anyhow::Result<()> {
+		self.request::<IgnoredAny>(
+			Method::POST,
+			&format!("v2/users/{user_id}/{action}"),
+			None,
+			Some(json!({})),
+		)
+		.await
+		.with_context(|| format!("{action} service account {user_id}"))?;
 		Ok(())
 	}
 
@@ -857,7 +973,11 @@ impl ZitadelClient {
 		org_id: &str,
 	) -> anyhow::Result<BTreeMap<String, String>> {
 		let entries: Vec<MetadataEntry> = self
-			.list_paged(&format!("users/{user_id}/metadata/_search"), org_id)
+			.list_paged::<_, ()>(
+				&format!("management/v1/users/{user_id}/metadata/_search"),
+				org_id,
+				&[],
+			)
 			.await
 			.with_context(|| format!("listing metadata of service account {user_id}"))?;
 		Ok(entries
@@ -909,25 +1029,25 @@ impl ZitadelClient {
 
 	// --- Transport -----------------------------------------------------------
 
-	/// Collects every page of a management API `_search` endpoint.
-	async fn list_paged<T: DeserializeOwned>(
+	/// Collects every page of a search endpoint at `path` (relative to the
+	/// Zitadel base URL), filtered by `queries` if any.
+	async fn list_paged<T: DeserializeOwned, Q: Serialize>(
 		&self,
 		path: &str,
 		org_id: &str,
+		queries: &[Q],
 	) -> anyhow::Result<Vec<T>> {
 		let mut all = Vec::new();
 		let mut offset = 0usize;
 		loop {
-			let page: Listing<T> = self
-				.call(
-					Method::POST,
-					path,
-					org_id,
-					Some(json!({
-						"query": { "offset": offset.to_string(), "limit": PAGE_SIZE, "asc": true },
-					})),
-				)
-				.await?;
+			let mut body = json!({
+				"query": { "offset": offset.to_string(), "limit": PAGE_SIZE, "asc": true },
+			});
+			if !queries.is_empty() {
+				body["queries"] = serde_json::to_value(queries)?;
+			}
+			let page: Listing<T> =
+				self.request(Method::POST, path, Some(org_id), Some(body)).await?;
 			let count = page.result.len();
 			all.extend(page.result);
 			if count < PAGE_SIZE {
@@ -961,10 +1081,7 @@ impl ZitadelClient {
 		body: Option<serde_json::Value>,
 	) -> anyhow::Result<T> {
 		let url = self.url.join(path)?;
-		let mut request = self
-			.http
-			.request(method, url)
-			.bearer_auth(self.token.token().await.context("refreshing Zitadel access token")?);
+		let mut request = self.http.request(method, url).bearer_auth(self.access_token().await?);
 		if let Some(org_id) = org_id {
 			request = request.header(HEADER_ZITADEL_ORGANIZATION_ID, org_id);
 		}
@@ -1012,6 +1129,8 @@ pub(crate) mod tests {
 				"token_type": "Bearer",
 				"expires_in": 3600,
 			})))
+			// Reused for every request (checked when the server is dropped).
+			.expect(1)
 			.mount(server)
 			.await;
 
@@ -1480,6 +1599,41 @@ pub(crate) mod tests {
 		reconcile_org_member("555", roles(), Some(ORG_ID)).await;
 		// The grant dropped its org roles.
 		reconcile_org_member(ORG_ID, Vec::new(), None).await;
+	}
+
+	#[tokio::test]
+	async fn reuses_the_access_token_until_it_expires() {
+		let server = MockServer::start().await;
+		let client = test_client(&server).await;
+		Mock::given(method("POST"))
+			.and(path("/management/v1/orgs/me/members"))
+			.and(header("authorization", "Bearer test-token"))
+			.respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+			.expect(3)
+			.mount(&server)
+			.await;
+		for _ in 0..3 {
+			client.ensure_org_member(ORG_ID, USER_ID, &roles()).await.expect("org member added");
+		}
+		// The token endpoint mock of `test_client` expects exactly one call.
+
+		// Close to expiry, the token is renewed.
+		client.token.lock().await.cached =
+			Some(("old".to_string(), Instant::now() + TOKEN_RENEWAL_MARGIN / 2));
+		let server = MockServer::start().await;
+		Mock::given(method("POST"))
+			.and(path("/oauth/v2/token"))
+			.respond_with(ResponseTemplate::new(200).set_body_json(json!({
+				"access_token": "new-token",
+				"token_type": "Bearer",
+				"expires_in": 3600,
+			})))
+			.expect(1)
+			.mount(&server)
+			.await;
+		let client = ZitadelClient { url: format!("{}/", server.uri()).parse().unwrap(), ..client };
+		assert_eq!(client.access_token().await.expect("renewed"), "new-token");
+		assert_eq!(client.access_token().await.expect("cached"), "new-token");
 	}
 
 	#[tokio::test]
