@@ -411,18 +411,27 @@ mod tests {
 		//= type=test
 		//# zapp MUST record the verified issuer in the metadata of the service
 		//# account, and for a subject-scoped grant also the verified subject.
-		let expected_metadata = BTreeMap::from([
+		let account_metadata = BTreeMap::from([
 			("origin".to_string(), iss.clone()),
-			("creator.10".to_string(), "1".to_string()),
 			("subject".to_string(), subject.to_string()),
 		]);
-		Mock::given(method("POST"))
-			.and(path("/management/v1/users/20/metadata/_bulk"))
-			.and(move |request: &wiremock::Request| metadata_of(request) == expected_metadata)
-			.respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
-			.expect(1)
-			.mount(&zitadel)
-			.await;
+		//= docs/requirements/zapp.md#org-roles-1
+		//= type=test
+		//# zapp MUST record in the metadata of the service account the
+		//# organisation in which it gives the account organisation roles.
+		let project_metadata = BTreeMap::from([
+			("creator.10".to_string(), "1".to_string()),
+			("org_member".to_string(), "1".to_string()),
+		]);
+		for expected in [account_metadata, project_metadata] {
+			Mock::given(method("POST"))
+				.and(path("/management/v1/users/20/metadata/_bulk"))
+				.and(move |request: &wiremock::Request| metadata_of(request) == expected)
+				.respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+				.expect(1)
+				.mount(&zitadel)
+				.await;
+		}
 		Mock::given(method("POST"))
 			.and(path("/management/v1/orgs/me/members"))
 			.and(body_partial_json(json!({ "userId": "20", "roles": ["ORG_USER_MANAGER"] })))

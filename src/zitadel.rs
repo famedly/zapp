@@ -9,10 +9,7 @@ use base64::{Engine as _, prelude::BASE64_STANDARD};
 use famedly_zitadel_rust_client::v2::{
 	HEADER_ZITADEL_ORGANIZATION_ID, Zitadel,
 	authentication::Token,
-	management::{
-		V1GetProjectByIdResponse, V1Project, V1ProjectNameQuery, V1ProjectQuery, V1ProjectState,
-		V1TextQueryMethod,
-	},
+	management::{V1GetProjectByIdResponse, V1Project, V1ProjectState},
 	users::{
 		OrganizationIdQuery, SearchQuery, TextQueryMethod, TypeQuery, User, UserNameQuery,
 		UserState, Userv2Type,
@@ -45,6 +42,11 @@ pub const METADATA_ORIGIN: &str = "origin";
 /// overwrite it); only checked, with `origin`, before adopting an account
 /// by name.
 pub const METADATA_SUBJECT: &str = "subject";
+
+/// Metadata key holding the organisation in which zapp made the service
+/// account a member with organisation roles, so they can be revoked when the
+/// grant changes.
+pub const METADATA_ORG_MEMBER: &str = "org_member";
 
 /// Metadata key prefix `creator.<project id>` (value `1`) recording that the
 /// service account was provisioned as creator of that project.
@@ -223,19 +225,20 @@ impl ZitadelClient {
 	}
 
 	/// Ensures that in the home organisation (or else the entitlement's
-	/// organisation `org_id`) an active
-	/// project `name` and an active service account `name` exist, that the
-	/// service account records itself as creator of the project (metadata),
-	/// owns it and holds exactly `instance_roles` on the instance and
-	/// `org_roles` on the entitlement's organisation (each if any), and
-	/// issues a
-	/// credential of the requested kind valid for `duration`.
+	/// organisation `org_id`) an active service account `name` and an active
+	/// project exist, that the service account records itself as creator of
+	/// the project (metadata), owns it and holds exactly `instance_roles` on
+	/// the instance and `org_roles` on the entitlement's organisation (each if
+	/// any), and issues a credential of the requested kind valid for
+	/// `duration`.
 	///
-	/// Both are created optimistically and adopted (reactivated if needed)
-	/// on a name conflict, so renewals and concurrent requests converge on
-	/// the same pair. An adopted service account keeps its earlier
-	/// credentials until they expire; any other project it recorded itself
-	/// as creator of is removed, so an account owns exactly one project.
+	/// The service account is created optimistically and adopted (reactivated
+	/// if needed) on a name conflict, so renewals and concurrent requests
+	/// converge on the same one. Its project is the one it recorded itself as
+	/// creator of, else a new project `name`. An adopted service account keeps
+	/// its earlier credentials until they expire; any other project it
+	/// recorded itself as creator of is removed, so an account owns exactly
+	/// one project.
 	pub async fn provision(
 		&self,
 		name: &str,
@@ -256,10 +259,47 @@ impl ZitadelClient {
 			//# service account and the project in the grant's organisation.
 			None => grant_org_id.as_str(),
 		};
-		let project_id = self.ensure_project(name, org_id).await?;
-		let user_id = self
-			.ensure_service_account(name, issuer, subject.as_deref(), org_id, &project_id)
-			.await?;
+		let (user_id, recorded) =
+			self.ensure_service_account(name, issuer, subject.as_deref(), org_id).await?;
+		let project_ids = creator_project_ids(&recorded);
+		let project_id = self.ensure_project(name, org_id, &project_ids).await?;
+
+		// Revoke org roles the grant no longer gives before recording new ones.
+		let member_of = (!org_roles.is_empty()).then_some(grant_org_id.as_str());
+		let recorded_member_of = recorded.get(METADATA_ORG_MEMBER).map(String::as_str);
+		if let Some(old) = recorded_member_of
+			&& Some(old) != member_of
+		{
+			//= docs/requirements/zapp.md#org-roles-1
+			//# If the recorded organisation differs from the grant's
+			//# organisation or the grant names no organisation roles, zapp
+			//# MUST remove the service account's membership in the recorded
+			//# organisation before issuing a credential.
+			self.remove_org_member(old, &user_id).await?;
+			info!("removed service account {user_id} from organisation {old}");
+			if member_of.is_none() {
+				self.delete_user_metadata(&user_id, org_id, &[METADATA_ORG_MEMBER.to_string()])
+					.await?;
+			}
+		}
+		let creator_key = format!("{METADATA_CREATOR_PREFIX}{project_id}");
+		let mut metadata = Vec::new();
+		if !recorded.contains_key(&creator_key) {
+			metadata.push((creator_key.as_str(), "1"));
+		}
+		if let Some(org) = member_of
+			&& recorded_member_of != Some(org)
+		{
+			//= docs/requirements/zapp.md#org-roles-1
+			//# zapp MUST record in the metadata of the service account the
+			//# organisation in which it gives the account organisation roles.
+			metadata.push((METADATA_ORG_MEMBER, org));
+		}
+		if !metadata.is_empty() {
+			self.set_user_metadata(&user_id, org_id, &metadata).await?;
+		}
+		self.release_stale_projects(org_id, &user_id, &project_ids, &project_id).await?;
+
 		self.ensure_project_owner(org_id, &project_id, &user_id).await?;
 		// ponytail: a grant whose instance_roles were removed leaves existing
 		// memberships in place until GC deletes the account. Revoking them
@@ -267,13 +307,11 @@ impl ZitadelClient {
 		if !instance_roles.is_empty() {
 			self.ensure_instance_member(&user_id, instance_roles).await?;
 		}
-		// shortcut: like instance_roles, removed org_roles stay until GC
-		// deletes the account.
-		if !org_roles.is_empty() {
+		if let Some(org) = member_of {
 			//= docs/requirements/zapp.md#home-org-1
 			//# If a home organisation is configured, zapp MUST give the service
 			//# account its organisation roles on the grant's organisation.
-			self.ensure_org_member(grant_org_id, &user_id, org_roles).await?;
+			self.ensure_org_member(org, &user_id, org_roles).await?;
 		}
 
 		let expires_at = (OffsetDateTime::now_utc() + *duration)
@@ -291,53 +329,69 @@ impl ZitadelClient {
 		Ok(Provisioned { username: name.to_string(), user_id, project_id, credential, expires_at })
 	}
 
-	/// Creates project `name`, or adopts and reactivates the existing one.
-	async fn ensure_project(&self, name: &str, org_id: &str) -> anyhow::Result<String> {
+	/// Returns the first still existing project of `recorded` (the projects
+	/// the service account recorded itself as creator of), reactivated if
+	/// needed, or else creates project `name`.
+	async fn ensure_project(
+		&self,
+		name: &str,
+		org_id: &str,
+		recorded: &[String],
+	) -> anyhow::Result<String> {
+		//= docs/requirements/zapp.md#adopt-2
+		//# zapp MUST use the project the service account is recorded as
+		//# creator of, if that project still exists, and otherwise create a
+		//# project.
+		for project_id in recorded {
+			let Some(status) = self.project_status(org_id, project_id).await? else { continue };
+			if !status.active {
+				self.call::<IgnoredAny>(
+					Method::POST,
+					&format!("projects/{project_id}/_reactivate"),
+					org_id,
+					None,
+				)
+				.await
+				.context("reactivating project")?;
+				info!("reactivated project {name} ({project_id})");
+			}
+			return Ok(project_id.clone());
+		}
+
 		match self
 			.call::<IdResponse>(Method::POST, "projects", org_id, Some(json!({ "name": name })))
 			.await
 		{
-			Ok(created) => return Ok(created.id),
-			Err(e) if has_status(&e, StatusCode::CONFLICT) => {}
-			Err(e) => return Err(e.context("creating project")),
+			Ok(created) => Ok(created.id),
+			// A project owner can rename its project, so a project of this
+			// name may be another account's.
+			// shortcut: also refuses the project of a concurrent first request
+			// (a retry succeeds) and one whose creator metadata write failed
+			// (must be deleted by hand).
+			Err(e) if has_status(&e, StatusCode::CONFLICT) => {
+				//= docs/requirements/zapp.md#adopt-2
+				//# zapp MUST NOT adopt an existing project by its name: if a
+				//# project of the requested name exists that the service account
+				//# is not recorded as creator of, zapp MUST refuse the request.
+				anyhow::bail!(
+					"project {name} exists but its service account did not create it; refusing to take it over"
+				)
+			}
+			Err(e) => Err(e.context("creating project")),
 		}
-
-		let project = self.find_project_named(name, org_id).await?.with_context(|| {
-			format!("project {name} exists according to Zitadel but cannot be found")
-		})?;
-		let project_id = project.id().cloned().context("Zitadel returned a project without id")?;
-		if !matches!(project.state(), Some(V1ProjectState::Active)) {
-			self.call::<IgnoredAny>(
-				Method::POST,
-				&format!("projects/{project_id}/_reactivate"),
-				org_id,
-				None,
-			)
-			.await
-			.context("reactivating project")?;
-			info!("reactivated project {name} ({project_id})");
-		}
-		Ok(project_id)
 	}
 
-	/// Creates service account `name` with zapp's metadata, or adopts the
-	/// existing one: stamps the metadata, reactivates it and removes any
-	/// other project it recorded itself as creator of.
+	/// Creates service account `name` with zapp's `origin` (and `subject`)
+	/// metadata, or adopts the existing one if that metadata matches and
+	/// reactivates it. Returns its ID and its metadata before this call
+	/// (empty for a new account).
 	async fn ensure_service_account(
 		&self,
 		name: &str,
 		issuer: &str,
 		subject: Option<&str>,
 		org_id: &str,
-		project_id: &str,
-	) -> anyhow::Result<String> {
-		let creator_key = format!("{METADATA_CREATOR_PREFIX}{project_id}");
-		//= docs/requirements/zapp.md#audit-1
-		//# zapp MUST record the verified issuer in the metadata of the service
-		//# account, and for a subject-scoped grant also the verified subject.
-		let mut metadata = vec![(METADATA_ORIGIN, issuer), (creator_key.as_str(), "1")];
-		metadata.extend(subject.map(|subject| (METADATA_SUBJECT, subject)));
-
+	) -> anyhow::Result<(String, BTreeMap<String, String>)> {
 		let body = json!({
 			"userName": name,
 			"name": name,
@@ -345,15 +399,25 @@ impl ZitadelClient {
 		});
 		match self.call::<UserIdResponse>(Method::POST, "users/machine", org_id, Some(body)).await {
 			Ok(created) => {
+				//= docs/requirements/zapp.md#audit-1
+				//# zapp MUST record the verified issuer in the metadata of the
+				//# service account, and for a subject-scoped grant also the
+				//# verified subject.
+				let mut metadata = vec![(METADATA_ORIGIN, issuer)];
+				metadata.extend(subject.map(|subject| (METADATA_SUBJECT, subject)));
 				self.set_user_metadata(&created.user_id, org_id, &metadata).await?;
-				return Ok(created.user_id);
+				return Ok((created.user_id, BTreeMap::new()));
 			}
 			Err(e) if has_status(&e, StatusCode::CONFLICT) => {}
 			Err(e) => return Err(e.context("creating service account")),
 		}
 
+		// Usernames are unique across the instance unless organisations
+		// enforce their domains, so the name may be taken in another one.
 		let user = self.find_user_named(name, org_id).await?.with_context(|| {
-			format!("service account {name} exists according to Zitadel but cannot be found")
+			format!(
+				"service account {name} exists according to Zitadel but not in organisation {org_id}; remove it from the organisation it is in"
+			)
 		})?;
 		anyhow::ensure!(
 			user.machine().is_some(),
@@ -365,7 +429,8 @@ impl ZitadelClient {
 		// proves nothing: another issuer's or subject's account may have
 		// claimed it to be granted this one's roles.
 		// shortcut: an account whose creation succeeded but whose metadata
-		// write failed is refused too and must be deleted by hand.
+		// write failed is refused too and must be deleted by hand; so is one a
+		// concurrent first request has not stamped yet (a retry succeeds).
 		let recorded = self.user_metadata(&user_id, org_id).await?;
 		//= docs/requirements/zapp.md#adopt-1
 		//# zapp MUST adopt an existing service account of the requested name
@@ -382,7 +447,6 @@ impl ZitadelClient {
 			"service account {name} ({user_id}) exists but was not provisioned for this issuer and subject; refusing to take it over"
 		);
 
-		self.set_user_metadata(&user_id, org_id, &metadata).await?;
 		match user.state() {
 			Some(UserState::Inactive) => {
 				self.zitadel
@@ -397,12 +461,12 @@ impl ZitadelClient {
 			}
 			_ => {}
 		}
-		self.release_stale_projects(org_id, &user_id, project_id).await?;
-		Ok(user_id)
+		Ok((user_id, recorded))
 	}
 
-	/// Removes every project zapp recorded the service account as creator
-	/// of except `keep`, and forgets them in its metadata.
+	/// Removes every project of `recorded` (the projects zapp recorded the
+	/// service account as creator of) except `keep`, and forgets them in its
+	/// metadata.
 	///
 	/// Deliberately not gated on the account still being `PROJECT_OWNER`:
 	/// that role includes `project.member.delete`, so the account could
@@ -412,11 +476,10 @@ impl ZitadelClient {
 		&self,
 		org_id: &str,
 		user_id: &str,
+		recorded: &[String],
 		keep: &str,
 	) -> anyhow::Result<()> {
-		let metadata = self.user_metadata(user_id, org_id).await?;
-		let stale: Vec<String> =
-			creator_project_ids(&metadata).into_iter().filter(|id| id != keep).collect();
+		let stale: Vec<&String> = recorded.iter().filter(|id| *id != keep).collect();
 		if stale.is_empty() {
 			return Ok(());
 		}
@@ -542,25 +605,19 @@ impl ZitadelClient {
 		}
 	}
 
-	async fn find_project_named(
-		&self,
-		name: &str,
-		org_id: &str,
-	) -> anyhow::Result<Option<V1Project>> {
-		let query = V1ProjectQuery::new().with_name_query(
-			V1ProjectNameQuery::new()
-				.with_name(name.to_string())
-				.with_method(V1TextQueryMethod::Equals),
-		);
-		let projects: Vec<V1Project> = self
-			.zitadel
-			.list_projects(Some(org_id.to_string()), None, Some(vec![query]))
-			.context("searching existing projects")?
-			.try_collect()
+	/// Removes the service account's membership in organisation `org_id`;
+	/// no membership is fine.
+	async fn remove_org_member(&self, org_id: &str, user_id: &str) -> anyhow::Result<()> {
+		match self
+			.call::<IgnoredAny>(Method::DELETE, &format!("orgs/me/members/{user_id}"), org_id, None)
 			.await
-			.context("searching existing projects")?;
-		// Exact-match query, but never adopt anything we did not ask for.
-		Ok(projects.into_iter().find(|project| project.name().map(String::as_str) == Some(name)))
+		{
+			Ok(_) => Ok(()),
+			Err(e) if has_status(&e, StatusCode::NOT_FOUND) => Ok(()),
+			Err(e) => {
+				Err(e.context(format!("removing service account from organisation {org_id}")))
+			}
+		}
 	}
 
 	async fn find_user_named(&self, name: &str, org_id: &str) -> anyhow::Result<Option<User>> {
@@ -1110,12 +1167,10 @@ pub(crate) mod tests {
 
 	/// Runs `ensure_service_account` for issuer `https://k8s.example.com` and
 	/// `subject` against a Zitadel where the name is already taken by a
-	/// machine user carrying `existing` metadata. `adopt` says whether zapp
-	/// may write to that account.
+	/// machine user carrying `existing` metadata. Adoption writes nothing.
 	async fn adopt_existing(
 		subject: Option<&str>,
 		existing: &[(&str, &str)],
-		adopt: bool,
 	) -> anyhow::Result<String> {
 		let server = MockServer::start().await;
 		let client = test_client(&server).await;
@@ -1147,10 +1202,12 @@ pub(crate) mod tests {
 		Mock::given(method("POST"))
 			.and(path(format!("/management/v1/users/{USER_ID}/metadata/_bulk")))
 			.respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
-			.expect(u64::from(adopt))
+			.expect(0)
 			.mount(&server)
 			.await;
-		client.ensure_service_account(name, "https://k8s.example.com", subject, ORG_ID, "10").await
+		let (user_id, _) =
+			client.ensure_service_account(name, "https://k8s.example.com", subject, ORG_ID).await?;
+		Ok(user_id)
 	}
 
 	#[tokio::test]
@@ -1170,11 +1227,11 @@ pub(crate) mod tests {
 			// Not zapp's at all.
 			&[],
 		] {
-			let err = adopt_existing(subject, existing, false).await.expect_err("refused");
+			let err = adopt_existing(subject, existing).await.expect_err("refused");
 			assert!(err.to_string().contains("not provisioned for"), "{existing:?}: {err}");
 		}
 		let existing = [("origin", "https://k8s.example.com"), ("subject", "x")];
-		assert!(adopt_existing(None, &existing, false).await.is_err());
+		assert!(adopt_existing(None, &existing).await.is_err());
 	}
 
 	#[tokio::test]
@@ -1190,12 +1247,11 @@ pub(crate) mod tests {
 			("subject", "system:serviceaccount:b:api"),
 			("creator.10", "1"),
 		];
-		let user_id = adopt_existing(Some("system:serviceaccount:b:api"), &existing, true)
-			.await
-			.expect("adopted");
+		let user_id =
+			adopt_existing(Some("system:serviceaccount:b:api"), &existing).await.expect("adopted");
 		assert_eq!(user_id, USER_ID);
 		let existing = [("origin", "https://k8s.example.com"), ("creator.10", "1")];
-		adopt_existing(None, &existing, true).await.expect("adopted");
+		adopt_existing(None, &existing).await.expect("adopted");
 	}
 
 	/// Provisions with org roles against a Zitadel that expects the account
@@ -1204,18 +1260,19 @@ pub(crate) mod tests {
 		let server = MockServer::start().await;
 		let client = test_client_with_home(&server, home).await;
 		let ok = |body: serde_json::Value| ResponseTemplate::new(200).set_body_json(body);
-		for (route, body) in [
-			("/management/v1/projects", json!({ "id": "10" })),
-			("/management/v1/users/machine", json!({ "userId": USER_ID })),
-			(&format!("/management/v1/users/{USER_ID}/metadata/_bulk"), json!({})),
-			("/management/v1/projects/10/members", json!({})),
-			(&format!("/management/v1/users/{USER_ID}/pats"), json!({ "token": "pat" })),
+		for (route, body, calls) in [
+			("/management/v1/projects", json!({ "id": "10" }), 1),
+			("/management/v1/users/machine", json!({ "userId": USER_ID }), 1),
+			// origin, then creator and org_member
+			(&format!("/management/v1/users/{USER_ID}/metadata/_bulk"), json!({}), 2),
+			("/management/v1/projects/10/members", json!({}), 1),
+			(&format!("/management/v1/users/{USER_ID}/pats"), json!({ "token": "pat" }), 1),
 		] {
 			Mock::given(method("POST"))
 				.and(path(route))
 				.and(header(HEADER_ZITADEL_ORGANIZATION_ID, account_org))
 				.respond_with(ok(body))
-				.expect(1)
+				.expect(calls)
 				.mount(&server)
 				.await;
 		}
@@ -1269,6 +1326,160 @@ pub(crate) mod tests {
 		//# If a home organisation is configured, zapp MUST give the service
 		//# account its organisation roles on the grant's organisation.
 		provision_in(Some("999"), "999").await;
+	}
+
+	#[tokio::test]
+	async fn uses_the_recorded_project_and_never_adopts_by_name() {
+		let server = MockServer::start().await;
+		let client = test_client(&server).await;
+		Mock::given(method("GET"))
+			.and(path("/management/v1/projects/10"))
+			.respond_with(ResponseTemplate::new(404))
+			.mount(&server)
+			.await;
+		Mock::given(method("GET"))
+			.and(path("/management/v1/projects/11"))
+			.respond_with(ResponseTemplate::new(200).set_body_json(json!({
+				"project": { "id": "11", "state": "PROJECT_STATE_INACTIVE" },
+			})))
+			.mount(&server)
+			.await;
+		Mock::given(method("POST"))
+			.and(path("/management/v1/projects/11/_reactivate"))
+			.respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+			.expect(1)
+			.mount(&server)
+			.await;
+		// Another account's project, renamed to this account's name.
+		Mock::given(method("POST"))
+			.and(path("/management/v1/projects"))
+			.respond_with(ResponseTemplate::new(409))
+			.expect(1)
+			.mount(&server)
+			.await;
+
+		//= docs/requirements/zapp.md#adopt-2
+		//= type=test
+		//# zapp MUST use the project the service account is recorded as
+		//# creator of, if that project still exists, and otherwise create a
+		//# project.
+		let recorded = ["10".to_string(), "11".to_string()];
+		assert_eq!(client.ensure_project("zapp/a", ORG_ID, &recorded).await.expect("found"), "11");
+
+		//= docs/requirements/zapp.md#adopt-2
+		//= type=test
+		//# zapp MUST NOT adopt an existing project by its name: if a project of
+		//# the requested name exists that the service account is not recorded
+		//# as creator of, zapp MUST refuse the request.
+		let err = client.ensure_project("zapp/a", ORG_ID, &[]).await.expect_err("refused");
+		assert!(err.to_string().contains("refusing"), "{err}");
+	}
+
+	/// Provisions an existing account that recorded org roles in `old_org`
+	/// for a grant giving `org_roles` on `ORG_ID`, expecting its membership in
+	/// `old_org` to be removed and its `org_member` metadata to be `expected`.
+	async fn reconcile_org_member(old_org: &str, org_roles: Vec<String>, expected: Option<&str>) {
+		let server = MockServer::start().await;
+		let client = test_client_with_home(&server, Some("999")).await;
+		let name = "zapp/k8s.example.com";
+		let ok = |body: serde_json::Value| ResponseTemplate::new(200).set_body_json(body);
+		Mock::given(method("POST"))
+			.and(path("/management/v1/users/machine"))
+			.respond_with(ResponseTemplate::new(409))
+			.mount(&server)
+			.await;
+		Mock::given(method("POST"))
+			.and(path("/v2/users"))
+			.respond_with(ok(json!({ "result": [{
+				"userId": USER_ID,
+				"username": name,
+				"state": "USER_STATE_ACTIVE",
+				"machine": { "name": name },
+			}] })))
+			.mount(&server)
+			.await;
+		let recorded: Vec<_> =
+			[("origin", "https://k8s.example.com"), ("creator.10", "1"), ("org_member", old_org)]
+				.iter()
+				.map(|(key, value)| json!({ "key": key, "value": BASE64_STANDARD.encode(value) }))
+				.collect();
+		Mock::given(method("POST"))
+			.and(path(format!("/management/v1/users/{USER_ID}/metadata/_search")))
+			.respond_with(ok(json!({ "result": recorded })))
+			.mount(&server)
+			.await;
+		Mock::given(method("GET"))
+			.and(path("/management/v1/projects/10"))
+			.respond_with(ok(json!({ "project": { "id": "10", "state": "PROJECT_STATE_ACTIVE" } })))
+			.mount(&server)
+			.await;
+		Mock::given(method("POST"))
+			.and(path("/management/v1/projects/10/members"))
+			.respond_with(ok(json!({})))
+			.mount(&server)
+			.await;
+		Mock::given(method("DELETE"))
+			.and(path(format!("/management/v1/orgs/me/members/{USER_ID}")))
+			.and(header(HEADER_ZITADEL_ORGANIZATION_ID, old_org))
+			.respond_with(ok(json!({})))
+			.expect(1)
+			.mount(&server)
+			.await;
+		let set = expected.map(
+			|org| json!({ "metadata": [{ "key": "org_member", "value": BASE64_STANDARD.encode(org) }] }),
+		);
+		Mock::given(method("POST"))
+			.and(path(format!("/management/v1/users/{USER_ID}/metadata/_bulk")))
+			.and(body_json(set.unwrap_or_default()))
+			.respond_with(ok(json!({})))
+			.expect(u64::from(expected.is_some()))
+			.mount(&server)
+			.await;
+		Mock::given(method("DELETE"))
+			.and(path(format!("/management/v1/users/{USER_ID}/metadata/_bulk")))
+			.and(body_json(json!({ "keys": ["org_member"] })))
+			.respond_with(ok(json!({})))
+			.expect(u64::from(expected.is_none()))
+			.mount(&server)
+			.await;
+		Mock::given(method("POST"))
+			.and(path("/management/v1/orgs/me/members"))
+			.and(header(HEADER_ZITADEL_ORGANIZATION_ID, ORG_ID))
+			.respond_with(ok(json!({})))
+			.expect(u64::from(expected.is_some()))
+			.mount(&server)
+			.await;
+		Mock::given(method("POST"))
+			.and(path(format!("/management/v1/users/{USER_ID}/pats")))
+			.respond_with(ok(json!({ "token": "pat" })))
+			.mount(&server)
+			.await;
+
+		let entitlement = Entitlement {
+			org_id: ORG_ID.to_string(),
+			duration: Duration::from_secs(3600),
+			instance_roles: Vec::new(),
+			org_roles,
+			subject: None,
+		};
+		client
+			.provision(name, "https://k8s.example.com", &entitlement, CredentialType::Pat)
+			.await
+			.expect("provisioned");
+	}
+
+	#[tokio::test]
+	async fn revokes_org_roles_the_grant_no_longer_gives() {
+		//= docs/requirements/zapp.md#org-roles-1
+		//= type=test
+		//# If the recorded organisation differs from the grant's organisation
+		//# or the grant names no organisation roles, zapp MUST remove the
+		//# service account's membership in the recorded organisation before
+		//# issuing a credential.
+		// The grant moved from organisation 555 to ORG_ID.
+		reconcile_org_member("555", roles(), Some(ORG_ID)).await;
+		// The grant dropped its org roles.
+		reconcile_org_member(ORG_ID, Vec::new(), None).await;
 	}
 
 	#[tokio::test]
