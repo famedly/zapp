@@ -98,8 +98,9 @@ impl TokenClaims {
 	/// Names the service account (and project) for this issuer and a
 	/// subject: `<account_name>#<subject>`, the subject percent-encoded
 	/// outside `[a-z0-9:._-]` (so `#` never appears in it), or `None` if the
-	/// name would exceed Zitadel's 200 characters. Neither the prefix nor
-	/// the issuer part can contain `#`, so the name is unambiguous.
+	/// name would exceed Zitadel's 200 characters. Neither the issuer part
+	/// nor the encoded subject can contain `#`, so the last `#` separates
+	/// them and the name is unambiguous.
 	pub fn subject_account_name(&self, prefix: &str, subject: &str) -> Option<String> {
 		//= docs/requirements/zapp.md#subject-3
 		//# The name for a pair of issuer and subject MUST differ from the name
@@ -315,6 +316,7 @@ impl DomainVerifier {
 		#[derive(Deserialize)]
 		struct IntrospectionResponse {
 			active: bool,
+			#[serde(default, deserialize_with = "string_or_none")]
 			sub: Option<String>,
 		}
 
@@ -399,6 +401,18 @@ impl DomainVerifier {
 	}
 }
 
+/// A string, or `None` for any other JSON value: a malformed `sub` makes
+/// the token subject-less (so no subject-scoped grant matches) instead of
+/// failing verification for grants that ignore the subject.
+fn string_or_none<'de, D: serde::Deserializer<'de>>(
+	deserializer: D,
+) -> Result<Option<String>, D::Error> {
+	Ok(match serde_json::Value::deserialize(deserializer)? {
+		serde_json::Value::String(value) => Some(value),
+		_ => None,
+	})
+}
+
 /// Validates signature, expiry, audience and issuer of a token against a
 /// JWK set and returns its subject (`sub`), if any. Pure so it can be tested
 /// without network access.
@@ -435,6 +449,7 @@ fn validate_with_jwks(
 
 	#[derive(Deserialize)]
 	struct Validated {
+		#[serde(default, deserialize_with = "string_or_none")]
 		sub: Option<String>,
 	}
 	let validated = jsonwebtoken::decode::<Validated>(token, &key, &validation)
@@ -1012,9 +1027,26 @@ mod tests {
 		assert_eq!(claims.subject.as_deref(), Some("from-introspection"));
 		drop(mock);
 
-		introspected(json!({ "active": true })).mount(&server).await;
+		let mock = introspected(json!({ "active": true })).mount_as_scoped(&server).await;
 		let claims = verifier.verify(&token).await.expect("active token");
 		assert_eq!(claims.subject, None, "the unverified payload must not be used");
+		drop(mock);
+
+		// A non-string subject is no subject, not a failed verification.
+		introspected(json!({ "active": true, "sub": 42 })).mount(&server).await;
+		let claims = verifier.verify(&token).await.expect("active token");
+		assert_eq!(claims.subject, None);
+	}
+
+	#[test]
+	fn jwks_ignores_a_non_string_subject() {
+		let (key, jwks) = test_keypair();
+		let token = sign(
+			&key,
+			"test",
+			json!({ "iss": ISSUER, "aud": [AUDIENCE], "sub": 42, "exp": now() + 300 }),
+		);
+		assert_eq!(validate_with_jwks(&jwks, &token, AUDIENCE, ISSUER).expect("valid token"), None);
 	}
 
 	#[test]
